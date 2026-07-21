@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func newTestCached(t *testing.T) (*Cached, *fakeSource) {
@@ -75,8 +77,8 @@ func TestTransportRetriesOnceOn401(t *testing.T) {
 	if fake.calls != 2 {
 		t.Errorf("token mints = %d, want 2 (refresh on 401)", fake.calls)
 	}
-	if bodies[0] != `{"id":1}` || bodies[1] != `{"id":1}` {
-		t.Errorf("body not replayed on retry: %q", bodies)
+	if diff := cmp.Diff([]string{`{"id":1}`, `{"id":1}`}, bodies); diff != "" {
+		t.Errorf("body not replayed on retry (-want +got):\n%s", diff)
 	}
 }
 

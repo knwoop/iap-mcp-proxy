@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 // fakeIAP simulates IAP in front of a minimal Streamable HTTP MCP
@@ -159,15 +161,19 @@ func TestBridgeRoundTripJSON(t *testing.T) {
 	if _, ok := byID[1]["result"]; !ok {
 		t.Errorf("initialize response missing result: %v", byID[1])
 	}
-	res, _ := byID[2]["result"].(map[string]any)
-	if res == nil || res["echoedMethod"] != "tools/list" {
-		t.Errorf("tools/list not proxied with session: %v", byID[2])
+	wantList := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      float64(2),
+		"result":  map[string]any{"echoedMethod": "tools/list"},
+	}
+	if diff := cmp.Diff(wantList, byID[2]); diff != "" {
+		t.Errorf("tools/list response mismatch (-want +got):\n%s", diff)
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.deleted) != 1 || f.deleted[0] != "sess-123" {
-		t.Errorf("session not DELETEd on shutdown: %v", f.deleted)
+	if diff := cmp.Diff([]string{"sess-123"}, f.deleted); diff != "" {
+		t.Errorf("session DELETE mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -179,9 +185,14 @@ func TestBridgeRoundTripSSE(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("want 2 responses, got %d: %v", len(out), out)
 	}
+	wantCall := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      float64(2),
+		"result":  map[string]any{"echoedMethod": "tools/call"},
+	}
 	var sawCall bool
 	for _, m := range out {
-		if res, ok := m["result"].(map[string]any); ok && res["echoedMethod"] == "tools/call" {
+		if cmp.Equal(wantCall, m) {
 			sawCall = true
 		}
 	}
