@@ -1,0 +1,20 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # Best-effort writes and closes whose failures are deliberately
+      # ignored: stderr/stdout output, response body cleanup, and the
+      # OAuth callback listener teardown.
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (net.Listener).Close
+        - (*net/http.Server).Serve
+        - (*net/http.Server).Close
+        - (io.Writer).Write
+        - io.Copy
+        - io.WriteString
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln

@@ -2,6 +2,8 @@ module github.com/knwoop/iap-mcp-proxy
 
 go 1.26.2
 
+toolchain go1.26.5
+
 require (
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/oauth2 v0.36.0

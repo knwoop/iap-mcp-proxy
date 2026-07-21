@@ -18,10 +18,9 @@ import (
 // server: requests without a Proxy-Authorization bearer are redirected
 // to Google sign-in; valid ones reach the MCP handler.
 type fakeIAP struct {
-	mu       sync.Mutex
-	sessions map[string]bool
-	deleted  []string
-	useSSE   bool
+	mu      sync.Mutex
+	deleted []string
+	useSSE  bool
 }
 
 func (f *fakeIAP) handler() http.Handler {
