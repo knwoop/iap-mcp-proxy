@@ -1,0 +1,27 @@
+version: 2
+
+project_name: iap-mcp-proxy
+
+builds:
+  - main: ./cmd/iap-mcp-proxy
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: false
+
+changelog:
+  use: github-native
