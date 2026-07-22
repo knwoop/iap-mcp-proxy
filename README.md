@@ -66,7 +66,7 @@ iap-mcp-proxy [flags] <UPSTREAM_URL>
 | `--impersonate-service-account` | `IAP_MCP_IMPERSONATE_SA` | — | SA email to impersonate (implies `--credentials=impersonate`). |
 | `--downstream-auth` | `IAP_MCP_DOWNSTREAM_AUTH` | — | Value forwarded as the upstream `Authorization` header. Supports `env:VAR_NAME` indirection so secrets stay out of client config files. |
 | `--refresh-margin` | — | `5m` | Refresh the ID token this long before expiry. |
-| `--timeout` | — | `120s` | Per-request upstream timeout. |
+| `--timeout` | — | `120s` | Upstream timeout: total for JSON responses, idle (time between reads) for SSE streams — so long-running streaming tool calls are not killed while data or keepalives keep arriving. |
 | `--log-level` | `IAP_MCP_LOG` | `warn` | `debug` / `info` / `warn` / `error`. Logs go to stderr only. |
 | `--version` | — | — | Print version and exit. |
 
@@ -85,6 +85,7 @@ The principal must hold `roles/iap.httpsResourceAccessor` on the IAP resource.
 - The IAP token travels in `Proxy-Authorization`, which IAP consumes and strips — your app never sees it. If your app has its own auth, pass it with `--downstream-auth` and it is forwarded verbatim as `Authorization`.
 - On a 401 (or a 302 into Google sign-in) the proxy refreshes the token and retries once; a second failure is surfaced to the MCP client as a JSON-RPC error with an actionable message on stderr.
 - If the upstream reports the session expired (HTTP 404 — e.g. after a Cloud Run redeploy), the proxy transparently replays the cached `initialize` handshake to obtain a fresh session and retries the request; the stdio client never notices.
+- If a streaming (SSE) response drops mid-tool-call and the server tags events with IDs, the proxy resumes it with `Last-Event-ID` instead of losing the response.
 - After `initialize`, the proxy opens the standalone GET SSE stream so server-initiated messages (`notifications/tools/list_changed`, sampling/elicitation requests, log notifications) reach the client, reconnecting with `Last-Event-ID` if the stream drops. Servers that respond 405 (no standalone stream) are handled silently.
 - Exit codes: `0` clean shutdown, `1` fatal config error, `2` auth bootstrap failure.
 

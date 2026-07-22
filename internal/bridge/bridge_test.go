@@ -299,6 +299,97 @@ func TestBridgeStandaloneGETStream(t *testing.T) {
 	}
 }
 
+func TestBridgeResumesDroppedSSEResponse(t *testing.T) {
+	var mu sync.Mutex
+	var resumeIDs []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			// Stream one ID-tagged notification, then kill the
+			// connection mid-response.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "id: r1\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n\n")
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		case http.MethodGet:
+			mu.Lock()
+			resumeIDs = append(resumeIDs, r.Header.Get("Last-Event-ID"))
+			mu.Unlock()
+			// Replay the rest of the response, ending cleanly.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "id: r2\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n\n")
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	out := &syncBuffer{}
+	b := &Bridge{
+		Upstream:       srv.URL + "/mcp",
+		Client:         &http.Client{},
+		Timeout:        5 * time.Second,
+		ReconnectDelay: 5 * time.Millisecond,
+		Stdin:          strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/call"}` + "\n"),
+		Stdout:         out,
+	}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "notifications/progress") {
+		t.Errorf("pre-drop notification missing from stdout: %q", out.String())
+	}
+	if !strings.Contains(out.String(), `"result":{"ok":true}`) {
+		t.Errorf("resumed response missing from stdout: %q", out.String())
+	}
+	if strings.Contains(out.String(), `"error"`) {
+		t.Errorf("request errored instead of resuming: %q", out.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if diff := cmp.Diff([]string{"r1"}, resumeIDs); diff != "" {
+		t.Errorf("resume Last-Event-ID mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBridgeTimeoutIsIdleNotTotalForSSE(t *testing.T) {
+	// The stream stays active for well over --timeout, but no single
+	// gap between events exceeds it: the call must survive.
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		for i := 1; i <= 5; i++ {
+			fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":%d}}\n\n", i)
+			fl.Flush()
+			time.Sleep(60 * time.Millisecond)
+		}
+		fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"done\":true}}\n\n")
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	out := &syncBuffer{}
+	b := &Bridge{
+		Upstream: srv.URL + "/mcp",
+		Client:   &http.Client{},
+		Timeout:  200 * time.Millisecond, // < 300ms total stream duration
+		Stdin:    strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/call"}` + "\n"),
+		Stdout:   out,
+	}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if !strings.Contains(out.String(), `"result":{"done":true}`) {
+		t.Errorf("final response missing — stream was killed by total deadline: %q", out.String())
+	}
+	if got := strings.Count(out.String(), "notifications/progress"); got != 5 {
+		t.Errorf("want 5 progress notifications, got %d: %q", got, out.String())
+	}
+}
+
 // restartingServer simulates an upstream that loses its sessions
 // mid-conversation (a Cloud Run redeploy): each session is valid for
 // exactly one non-handshake request, after which it returns 404 until

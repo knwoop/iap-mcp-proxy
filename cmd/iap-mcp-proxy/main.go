@@ -46,7 +46,7 @@ func run() int {
 		impersonateSA  = fs.String("impersonate-service-account", envOr("IAP_MCP_IMPERSONATE_SA", ""), "service account email to impersonate (implies --credentials=impersonate)")
 		downstreamAuth = fs.String("downstream-auth", envOr("IAP_MCP_DOWNSTREAM_AUTH", ""), "value forwarded as the upstream Authorization header; supports env:VAR_NAME indirection")
 		refreshMargin  = fs.Duration("refresh-margin", 5*time.Minute, "refresh the ID token this long before expiry")
-		timeout        = fs.Duration("timeout", 120*time.Second, "per-request upstream timeout")
+		timeout        = fs.Duration("timeout", 120*time.Second, "upstream timeout: total for JSON responses, idle (between reads) for SSE streams")
 		logLevel       = fs.String("log-level", envOr("IAP_MCP_LOG", "warn"), "log level: debug, info, warn, error")
 		showVersion    = fs.Bool("version", false, "print version and exit")
 	)

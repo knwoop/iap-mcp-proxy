@@ -152,8 +152,16 @@ func (b *Bridge) post(ctx context.Context, msg []byte) (resp *http.Response, sen
 // and retrying the message, since a stdio client will never
 // re-initialize on its own.
 func (b *Bridge) forward(ctx context.Context, msg []byte) {
-	ctx, cancel := context.WithTimeout(ctx, b.timeout())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Watchdog rather than a fixed deadline: plain JSON exchanges get
+	// --timeout total, but SSE streams refresh it on every read, so it
+	// acts as an idle timeout there — a tool call that legitimately
+	// streams (or keepalive-pings) for longer than --timeout is never
+	// killed mid-flight; only a silent connection is.
+	watchdog := time.AfterFunc(b.timeout(), cancel)
+	defer watchdog.Stop()
+	refresh := func() { watchdog.Reset(b.timeout()) }
 
 	resp, sentSession, err := b.post(ctx, msg)
 	if err != nil {
@@ -168,6 +176,7 @@ func (b *Bridge) forward(ctx context.Context, msg []byte) {
 			b.replyError(msg, fmt.Sprintf("upstream session expired and re-initialize failed: %v", err))
 			return
 		}
+		refresh()
 		resp, _, err = b.post(ctx, msg)
 		if err != nil {
 			b.replyError(msg, err.Error())
@@ -196,16 +205,102 @@ func (b *Bridge) forward(ctx context.Context, msg []byte) {
 		}
 		b.emit(body)
 	case "text/event-stream":
-		err := readEvents(resp.Body, func(ev Event) error {
+		refresh()
+		var lastEventID string
+		err := readEvents(&activityReader{r: resp.Body, onRead: refresh}, func(ev Event) error {
+			if ev.ID != "" {
+				lastEventID = ev.ID
+			}
 			b.emit(ev.Data)
 			return nil
 		})
-		if err != nil && ctx.Err() == nil {
-			b.log().Warn("SSE stream ended with error", "error", err)
+		if err == nil || ctx.Err() != nil {
+			return
 		}
+		// The stream broke mid-response. If the server tagged its
+		// events with IDs, resume from the last one we saw instead of
+		// losing the rest of the response.
+		if lastEventID == "" {
+			b.log().Warn("SSE stream ended with error and cannot be resumed (no event IDs)", "error", err)
+			b.replyError(msg, "upstream SSE stream dropped mid-response")
+			return
+		}
+		b.resumeStream(ctx, msg, lastEventID, refresh)
 	default:
 		b.log().Warn("unexpected upstream content type", "content_type", resp.Header.Get("Content-Type"))
 	}
+}
+
+// resumeStream recovers a POST response whose SSE stream broke
+// mid-flight, by issuing GETs with Last-Event-ID (Streamable HTTP
+// resumability) until the replayed stream ends cleanly.
+func (b *Bridge) resumeStream(ctx context.Context, inbound []byte, lastEventID string, refresh func()) {
+	const maxAttempts = 3
+	delay := b.ReconnectDelay
+	if delay <= 0 {
+		delay = time.Second
+	}
+	for attempt := 1; attempt <= maxAttempts && ctx.Err() == nil; attempt++ {
+		b.log().Debug("SSE stream dropped mid-response; resuming", "last_event_id", lastEventID, "attempt", attempt)
+		refresh()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.Upstream, nil)
+		if err != nil {
+			break
+		}
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Last-Event-ID", lastEventID)
+		if sid := b.session(); sid != "" {
+			req.Header.Set(sessionHeader, sid)
+		}
+		if pv := b.protocolVersion(); pv != "" {
+			req.Header.Set(protocolHeader, pv)
+		}
+
+		resp, err := b.Client.Do(req)
+		if err != nil {
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
+			}
+			break
+		}
+		if resp.StatusCode != http.StatusOK || mediaType(resp.Header.Get("Content-Type")) != "text/event-stream" {
+			// The server does not support resumability (or refused);
+			// retrying will not help.
+			b.log().Debug("resume GET refused", "status", resp.StatusCode)
+			drainBody(resp)
+			break
+		}
+		err = readEvents(&activityReader{r: resp.Body, onRead: refresh}, func(ev Event) error {
+			if ev.ID != "" {
+				lastEventID = ev.ID
+			}
+			b.emit(ev.Data)
+			return nil
+		})
+		resp.Body.Close()
+		if err == nil {
+			// Clean end: the response was fully delivered.
+			return
+		}
+	}
+	b.replyError(inbound, "upstream SSE stream dropped mid-response and resumption failed")
+}
+
+// activityReader refreshes a watchdog on every successful read, turning
+// a total deadline into an idle timeout for streaming bodies.
+type activityReader struct {
+	r      io.Reader
+	onRead func()
+}
+
+func (a *activityReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.onRead()
+	}
+	return n, err
 }
 
 // emit writes one JSON-RPC message to stdout as a single line, and
