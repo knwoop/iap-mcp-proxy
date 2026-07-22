@@ -84,6 +84,7 @@ The principal must hold `roles/iap.httpsResourceAccessor` on the IAP resource.
 
 - The IAP token travels in `Proxy-Authorization`, which IAP consumes and strips — your app never sees it. If your app has its own auth, pass it with `--downstream-auth` and it is forwarded verbatim as `Authorization`.
 - On a 401 (or a 302 into Google sign-in) the proxy refreshes the token and retries once; a second failure is surfaced to the MCP client as a JSON-RPC error with an actionable message on stderr.
+- If the upstream reports the session expired (HTTP 404 — e.g. after a Cloud Run redeploy), the proxy transparently replays the cached `initialize` handshake to obtain a fresh session and retries the request; the stdio client never notices.
 - After `initialize`, the proxy opens the standalone GET SSE stream so server-initiated messages (`notifications/tools/list_changed`, sampling/elicitation requests, log notifications) reach the client, reconnecting with `Last-Event-ID` if the stream drops. Servers that respond 405 (no standalone stream) are handled silently.
 - Exit codes: `0` clean shutdown, `1` fatal config error, `2` auth bootstrap failure.
 

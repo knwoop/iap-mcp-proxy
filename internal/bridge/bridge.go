@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -45,6 +46,15 @@ type Bridge struct {
 	stateMu   sync.Mutex
 	sessionID string
 	protocol  string
+	// Cached client handshake messages, replayed to transparently
+	// re-establish the session when the upstream reports it expired
+	// (e.g. after a Cloud Run redeploy).
+	initMsg        []byte
+	initializedMsg []byte
+
+	// reinitMu serializes session recovery so concurrent 404s trigger
+	// a single re-initialize.
+	reinitMu sync.Mutex
 
 	listenOnce sync.Once
 }
@@ -69,14 +79,19 @@ func (b *Bridge) Run(ctx context.Context) error {
 			// Everything else runs concurrently: a long tool call must
 			// not block a client response to a server-initiated request
 			// arriving inside another request's SSE stream.
-			if isInitialize(msg) {
+			switch probeMethod(msg) {
+			case "initialize":
+				b.setHandshake(&b.initMsg, msg)
 				b.forward(ctx, msg)
 				// With the session established, open the standalone GET
 				// stream for server-initiated messages that arrive
 				// outside any request (list_changed notifications,
 				// sampling/elicitation requests, logs).
 				b.listenOnce.Do(func() { go b.listen(ctx) })
-			} else {
+			case "notifications/initialized":
+				b.setHandshake(&b.initializedMsg, msg)
+				wg.Go(func() { b.forward(ctx, msg) })
+			default:
 				wg.Go(func() { b.forward(ctx, msg) })
 			}
 		}
@@ -92,44 +107,73 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 }
 
-func isInitialize(msg []byte) bool {
-	if !bytes.Contains(msg, []byte(`"initialize"`)) {
-		return false
-	}
+func probeMethod(msg []byte) string {
 	var probe struct {
 		Method string `json:"method"`
 	}
-	return json.Unmarshal(msg, &probe) == nil && probe.Method == "initialize"
+	if json.Unmarshal(msg, &probe) != nil {
+		return ""
+	}
+	return probe.Method
 }
 
-// forward POSTs one JSON-RPC message upstream and relays the response.
-func (b *Bridge) forward(ctx context.Context, msg []byte) {
-	ctx, cancel := context.WithTimeout(ctx, b.timeout())
-	defer cancel()
-
+// post sends one JSON-RPC message upstream, attaching the current
+// session (returned as sentSession) and protocol version headers, and
+// records any session ID the response carries.
+func (b *Bridge) post(ctx context.Context, msg []byte) (resp *http.Response, sentSession string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.Upstream, bytes.NewReader(msg))
 	if err != nil {
-		b.replyError(msg, fmt.Sprintf("building upstream request: %v", err))
-		return
+		return nil, "", fmt.Errorf("building upstream request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if sid := b.session(); sid != "" {
-		req.Header.Set(sessionHeader, sid)
+	sentSession = b.session()
+	if sentSession != "" {
+		req.Header.Set(sessionHeader, sentSession)
 	}
 	if pv := b.protocolVersion(); pv != "" {
 		req.Header.Set(protocolHeader, pv)
 	}
 
-	resp, err := b.Client.Do(req)
+	resp, err = b.Client.Do(req)
 	if err != nil {
-		b.replyError(msg, fmt.Sprintf("upstream request failed: %v", err))
+		return nil, sentSession, fmt.Errorf("upstream request failed: %w", err)
+	}
+	if sid := resp.Header.Get(sessionHeader); sid != "" {
+		b.setSession(sid)
+	}
+	return resp, sentSession, nil
+}
+
+// forward POSTs one JSON-RPC message upstream and relays the response.
+// A 404 on a request that carried a session ID means the session
+// expired (spec: the client MUST start a new session); the bridge
+// recovers transparently by replaying the cached initialize handshake
+// and retrying the message, since a stdio client will never
+// re-initialize on its own.
+func (b *Bridge) forward(ctx context.Context, msg []byte) {
+	ctx, cancel := context.WithTimeout(ctx, b.timeout())
+	defer cancel()
+
+	resp, sentSession, err := b.post(ctx, msg)
+	if err != nil {
+		b.replyError(msg, err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	if sid := resp.Header.Get(sessionHeader); sid != "" {
-		b.setSession(sid)
+	if resp.StatusCode == http.StatusNotFound && sentSession != "" {
+		drainBody(resp)
+		if err := b.recoverSession(ctx, sentSession); err != nil {
+			b.replyError(msg, fmt.Sprintf("upstream session expired and re-initialize failed: %v", err))
+			return
+		}
+		resp, _, err = b.post(ctx, msg)
+		if err != nil {
+			b.replyError(msg, err.Error())
+			return
+		}
+		defer resp.Body.Close()
 	}
 
 	switch {
@@ -208,6 +252,54 @@ func (b *Bridge) replyError(inbound []byte, detail string) {
 	io.WriteString(b.Stdout, "\n")
 }
 
+// recoverSession transparently re-establishes an expired session by
+// replaying the cached initialize request (and the initialized
+// notification), without emitting anything to the stdio client, which
+// believes its original session is still alive. Concurrent callers are
+// serialized; only the first one whose stale session is still current
+// performs the replay.
+func (b *Bridge) recoverSession(ctx context.Context, stale string) error {
+	b.reinitMu.Lock()
+	defer b.reinitMu.Unlock()
+	if stale == "" {
+		return errors.New("request carried no session")
+	}
+	if b.session() != stale {
+		// Another goroutine already re-established the session.
+		return nil
+	}
+	init := b.handshake(&b.initMsg)
+	if init == nil {
+		return errors.New("no cached initialize request to replay")
+	}
+	b.log().Warn("upstream session expired; re-initializing transparently", "stale_session", stale)
+	b.clearSession(stale)
+
+	resp, _, err := b.post(ctx, init)
+	if err != nil {
+		return err
+	}
+	sid := resp.Header.Get(sessionHeader)
+	drainBody(resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("replayed initialize returned HTTP %d", resp.StatusCode)
+	}
+	if sid == "" {
+		return errors.New("replayed initialize returned no session ID")
+	}
+	b.forceSession(sid)
+
+	if note := b.handshake(&b.initializedMsg); note != nil {
+		if resp, _, err := b.post(ctx, note); err == nil {
+			drainBody(resp)
+		} else {
+			b.log().Warn("replaying initialized notification failed", "error", err)
+		}
+	}
+	b.log().Info("session re-established", "session", sid)
+	return nil
+}
+
 // listen maintains the standalone GET SSE stream (Streamable HTTP
 // spec: "Listening for Messages from the Server"), reconnecting with
 // exponential backoff and Last-Event-ID resumption until ctx is
@@ -248,7 +340,8 @@ func (b *Bridge) listenStream(ctx context.Context, lastEventID *string) (gotEven
 		return false, false
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	if sid := b.session(); sid != "" {
+	sid := b.session()
+	if sid != "" {
 		req.Header.Set(sessionHeader, sid)
 	}
 	if pv := b.protocolVersion(); pv != "" {
@@ -274,9 +367,13 @@ func (b *Bridge) listenStream(ctx context.Context, lastEventID *string) (gotEven
 		b.log().Debug("upstream does not offer a standalone GET stream")
 		return false, false
 	case resp.StatusCode == http.StatusNotFound:
-		// Session gone; only a client re-initialize can fix that.
-		b.log().Warn("GET stream rejected: session no longer valid")
-		return false, false
+		// Session gone (e.g. upstream redeploy): re-establish it
+		// transparently, then reconnect.
+		if err := b.recoverSession(ctx, sid); err != nil {
+			b.log().Warn("GET stream rejected and session recovery failed", "error", err)
+			return false, false
+		}
+		return false, true
 	case resp.StatusCode == http.StatusUnauthorized:
 		// The auth transport already refreshed and retried once; a
 		// persistent 401 will not heal by reconnecting.
@@ -352,12 +449,50 @@ func (b *Bridge) session() string {
 	return b.sessionID
 }
 
+// setSession records a session ID if none is set; the first response
+// carrying one wins. Recovery replaces it via clearSession/forceSession.
 func (b *Bridge) setSession(sid string) {
 	b.stateMu.Lock()
 	defer b.stateMu.Unlock()
 	if b.sessionID == "" {
 		b.sessionID = sid
 	}
+}
+
+// clearSession drops the session only if it still matches the stale
+// value, so a session established by a concurrent recovery survives.
+func (b *Bridge) clearSession(stale string) {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if b.sessionID == stale {
+		b.sessionID = ""
+	}
+}
+
+func (b *Bridge) forceSession(sid string) {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	b.sessionID = sid
+}
+
+func (b *Bridge) setHandshake(slot *[]byte, msg []byte) {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	*slot = msg
+}
+
+func (b *Bridge) handshake(slot *[]byte) []byte {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	return *slot
+}
+
+// drainBody fully consumes and closes a response body; used for
+// responses handled internally (recovery handshake, expired-session
+// errors) whose content is never relayed to the client.
+func drainBody(resp *http.Response) {
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 }
 
 func (b *Bridge) protocolVersion() string {

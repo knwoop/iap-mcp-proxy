@@ -299,6 +299,121 @@ func TestBridgeStandaloneGETStream(t *testing.T) {
 	}
 }
 
+// restartingServer simulates an upstream that loses its sessions
+// mid-conversation (a Cloud Run redeploy): each session is valid for
+// exactly one non-handshake request, after which it returns 404 until
+// the client re-initializes.
+type restartingServer struct {
+	mu           sync.Mutex
+	gen          int
+	validSession string
+	initCount    int
+	notifyCount  int
+}
+
+func (s *restartingServer) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var msg struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.Unmarshal(body, &msg); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		switch msg.Method {
+		case "initialize":
+			s.gen++
+			s.initCount++
+			s.validSession = fmt.Sprintf("sess-%d", s.gen)
+			w.Header().Set("Mcp-Session-Id", s.validSession)
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"flaky","version":"1"}}}`, msg.ID)
+		case "notifications/initialized":
+			s.notifyCount++
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			if r.Header.Get("Mcp-Session-Id") != s.validSession {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			// One request per session, then the "redeploy" hits.
+			s.validSession = ""
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"echoedMethod":%q}}`, msg.ID, msg.Method)
+		}
+	})
+}
+
+func TestBridgeRecoversFromSessionExpiry(t *testing.T) {
+	s := &restartingServer{}
+	srv := httptest.NewServer(s.handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := &syncBuffer{}
+	b := &Bridge{
+		Upstream: srv.URL + "/mcp",
+		Client:   &http.Client{Transport: authStub{}},
+		Timeout:  5 * time.Second,
+		Stdin: strings.NewReader(strings.Join([]string{
+			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+			`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+			`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+			`{"jsonrpc":"2.0","id":3,"method":"tools/call"}`,
+		}, "\n") + "\n"),
+		Stdout: out,
+	}
+	if err := b.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	cancel()
+
+	got := map[float64]map[string]any{}
+	for line := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("stdout line is not JSON: %q", line)
+		}
+		got[m["id"].(float64)] = m
+	}
+
+	// The client must see exactly its three responses — the replayed
+	// initialize is internal and must never surface.
+	if len(got) != 3 {
+		t.Fatalf("want 3 responses on stdout, got %d: %v", len(got), got)
+	}
+	for _, id := range []float64{2, 3} {
+		if errObj, ok := got[id]["error"]; ok {
+			t.Errorf("request %v failed instead of recovering: %v", id, errObj)
+		}
+		if _, ok := got[id]["result"]; !ok {
+			t.Errorf("request %v missing result: %v", id, got[id])
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// tools/list kills session 1, so tools/call must have triggered
+	// exactly one transparent re-initialize (handshake replayed too).
+	if s.initCount != 2 {
+		t.Errorf("initialize count = %d, want 2 (original + recovery)", s.initCount)
+	}
+	if s.notifyCount != 2 {
+		t.Errorf("initialized notification count = %d, want 2 (original + recovery)", s.notifyCount)
+	}
+}
+
 func TestBridgeSurfacesUpstreamFailureAsJSONRPCError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Goog-Iap-Generated-Response", "true")
