@@ -20,9 +20,10 @@ import (
 // server: requests without a Proxy-Authorization bearer are redirected
 // to Google sign-in; valid ones reach the MCP handler.
 type fakeIAP struct {
-	mu      sync.Mutex
-	deleted []string
-	useSSE  bool
+	mu         sync.Mutex
+	deleted    []string
+	useSSE     bool
+	getHandler http.HandlerFunc // standalone GET stream; nil → 405
 }
 
 func (f *fakeIAP) handler() http.Handler {
@@ -35,6 +36,13 @@ func (f *fakeIAP) handler() http.Handler {
 		}
 
 		switch r.Method {
+		case http.MethodGet:
+			if f.getHandler != nil {
+				f.getHandler(w, r)
+				return
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		case http.MethodDelete:
 			f.mu.Lock()
 			f.deleted = append(f.deleted, r.Header.Get("Mcp-Session-Id"))
@@ -92,7 +100,10 @@ func runBridge(t *testing.T, f *fakeIAP, stdinLines ...string) (stdout []map[str
 	srv := httptest.NewServer(f.handler())
 	defer srv.Close()
 
-	var out bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := &syncBuffer{}
 	b := &Bridge{
 		Upstream: srv.URL + "/mcp",
 		Client: &http.Client{
@@ -101,16 +112,18 @@ func runBridge(t *testing.T, f *fakeIAP, stdinLines ...string) (stdout []map[str
 				return http.ErrUseLastResponse
 			},
 		},
-		Timeout: 5 * time.Second,
-		Stdin:   strings.NewReader(strings.Join(stdinLines, "\n") + "\n"),
-		Stdout:  &syncWriter{w: &out},
+		Timeout:        5 * time.Second,
+		ReconnectDelay: 5 * time.Millisecond,
+		Stdin:          strings.NewReader(strings.Join(stdinLines, "\n") + "\n"),
+		Stdout:         out,
 	}
-	if err := b.Run(context.Background()); err != nil {
+	if err := b.Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	b.Shutdown(ctx)
+	shCtx, shCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shCancel()
+	b.Shutdown(shCtx)
+	cancel()
 
 	for line := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
 		if line == "" {
@@ -133,15 +146,21 @@ func (authStub) RoundTrip(r *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(r)
 }
 
-type syncWriter struct {
-	mu sync.Mutex
-	w  io.Writer
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
 }
 
-func (s *syncWriter) Write(p []byte) (int, error) {
+func (s *syncBuffer) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.w.Write(p)
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 func TestBridgeRoundTripJSON(t *testing.T) {
@@ -201,6 +220,85 @@ func TestBridgeRoundTripSSE(t *testing.T) {
 	}
 }
 
+func TestBridgeStandaloneGETStream(t *testing.T) {
+	f := &fakeIAP{}
+	var (
+		streamMu sync.Mutex
+		lastIDs  []string
+		sessions []string
+	)
+	f.getHandler = func(w http.ResponseWriter, r *http.Request) {
+		streamMu.Lock()
+		lastIDs = append(lastIDs, r.Header.Get("Last-Event-ID"))
+		sessions = append(sessions, r.Header.Get("Mcp-Session-Id"))
+		n := len(lastIDs)
+		streamMu.Unlock()
+		if n == 1 {
+			// First connection: deliver one server-initiated
+			// notification with an event ID, then drop the stream.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "id: 5\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n")
+			return
+		}
+		// Reconnections: signal that no stream is offered anymore.
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := &syncBuffer{}
+	b := &Bridge{
+		Upstream: srv.URL + "/mcp",
+		Client: &http.Client{
+			Transport: authStub{},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		Timeout:        5 * time.Second,
+		ReconnectDelay: 5 * time.Millisecond,
+		Stdin:          strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n"),
+		Stdout:         out,
+	}
+	if err := b.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Run returns at stdin EOF while the listener keeps working; wait
+	// for the notification to be relayed and the reconnect to happen.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		streamMu.Lock()
+		reconnected := len(lastIDs) >= 2
+		streamMu.Unlock()
+		if reconnected && strings.Contains(out.String(), "notifications/tools/list_changed") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out; GET connects: %v, stdout: %q", lastIDs, out.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	streamMu.Lock()
+	defer streamMu.Unlock()
+	if lastIDs[0] != "" {
+		t.Errorf("first GET carried Last-Event-ID %q, want empty", lastIDs[0])
+	}
+	if lastIDs[1] != "5" {
+		t.Errorf("reconnect Last-Event-ID = %q, want \"5\"", lastIDs[1])
+	}
+	for i, sid := range sessions {
+		if sid != "sess-123" {
+			t.Errorf("GET %d carried session %q, want sess-123", i, sid)
+		}
+	}
+}
+
 func TestBridgeSurfacesUpstreamFailureAsJSONRPCError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Goog-Iap-Generated-Response", "true")
@@ -208,20 +306,24 @@ func TestBridgeSurfacesUpstreamFailureAsJSONRPCError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var out bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := &syncBuffer{}
 	b := &Bridge{
 		Upstream: srv.URL,
 		Client:   &http.Client{Transport: authStub{}},
 		Timeout:  2 * time.Second,
 		Stdin:    strings.NewReader(`{"jsonrpc":"2.0","id":7,"method":"initialize"}` + "\n"),
-		Stdout:   &syncWriter{w: &out},
+		Stdout:   out,
 	}
-	if err := b.Run(context.Background()); err != nil {
+	if err := b.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
+	cancel()
 
 	var m map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &m); err != nil {
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &m); err != nil {
 		t.Fatalf("stdout not JSON: %q", out.String())
 	}
 	if m["id"].(float64) != 7 {

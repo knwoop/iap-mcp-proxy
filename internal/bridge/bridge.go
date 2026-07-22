@@ -32,6 +32,11 @@ type Bridge struct {
 	Timeout  time.Duration
 	Logger   *slog.Logger
 
+	// ReconnectDelay is the initial wait before re-opening the
+	// standalone GET stream after it drops. Defaults to 1s and backs
+	// off exponentially to 30s.
+	ReconnectDelay time.Duration
+
 	Stdin  io.Reader
 	Stdout io.Writer
 
@@ -40,6 +45,8 @@ type Bridge struct {
 	stateMu   sync.Mutex
 	sessionID string
 	protocol  string
+
+	listenOnce sync.Once
 }
 
 // Run processes stdin until EOF or ctx cancellation. Each inbound
@@ -64,6 +71,11 @@ func (b *Bridge) Run(ctx context.Context) error {
 			// arriving inside another request's SSE stream.
 			if isInitialize(msg) {
 				b.forward(ctx, msg)
+				// With the session established, open the standalone GET
+				// stream for server-initiated messages that arrive
+				// outside any request (list_changed notifications,
+				// sampling/elicitation requests, logs).
+				b.listenOnce.Do(func() { go b.listen(ctx) })
 			} else {
 				wg.Go(func() { b.forward(ctx, msg) })
 			}
@@ -194,6 +206,103 @@ func (b *Bridge) replyError(inbound []byte, detail string) {
 	defer b.writeMu.Unlock()
 	b.Stdout.Write(out)
 	io.WriteString(b.Stdout, "\n")
+}
+
+// listen maintains the standalone GET SSE stream (Streamable HTTP
+// spec: "Listening for Messages from the Server"), reconnecting with
+// exponential backoff and Last-Event-ID resumption until ctx is
+// canceled or the server signals the stream is not available.
+func (b *Bridge) listen(ctx context.Context) {
+	initial := b.ReconnectDelay
+	if initial <= 0 {
+		initial = time.Second
+	}
+	const maxDelay = 30 * time.Second
+
+	delay := initial
+	var lastEventID string
+	for ctx.Err() == nil {
+		gotEvents, retry := b.listenStream(ctx, &lastEventID)
+		if !retry {
+			return
+		}
+		if gotEvents {
+			delay = initial
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+		delay = min(delay*2, maxDelay)
+	}
+}
+
+// listenStream opens one GET stream and relays its events until it
+// ends. It reports whether any events arrived and whether the listener
+// should reconnect.
+func (b *Bridge) listenStream(ctx context.Context, lastEventID *string) (gotEvents, retry bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.Upstream, nil)
+	if err != nil {
+		b.log().Warn("building GET stream request", "error", err)
+		return false, false
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	if sid := b.session(); sid != "" {
+		req.Header.Set(sessionHeader, sid)
+	}
+	if pv := b.protocolVersion(); pv != "" {
+		req.Header.Set(protocolHeader, pv)
+	}
+	if *lastEventID != "" {
+		req.Header.Set("Last-Event-ID", *lastEventID)
+	}
+
+	resp, err := b.Client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, false
+		}
+		b.log().Debug("GET stream connection failed; will retry", "error", err)
+		return false, true
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusMethodNotAllowed:
+		// Server does not offer a standalone stream; that's fine.
+		b.log().Debug("upstream does not offer a standalone GET stream")
+		return false, false
+	case resp.StatusCode == http.StatusNotFound:
+		// Session gone; only a client re-initialize can fix that.
+		b.log().Warn("GET stream rejected: session no longer valid")
+		return false, false
+	case resp.StatusCode == http.StatusUnauthorized:
+		// The auth transport already refreshed and retried once; a
+		// persistent 401 will not heal by reconnecting.
+		b.log().Error("GET stream rejected: authentication failed")
+		return false, false
+	case resp.StatusCode != http.StatusOK:
+		b.log().Debug("GET stream unavailable; will retry", "status", resp.StatusCode)
+		return false, true
+	}
+	if mediaType(resp.Header.Get("Content-Type")) != "text/event-stream" {
+		b.log().Warn("GET stream returned unexpected content type", "content_type", resp.Header.Get("Content-Type"))
+		return false, false
+	}
+
+	err = readEvents(resp.Body, func(ev Event) error {
+		gotEvents = true
+		if ev.ID != "" {
+			*lastEventID = ev.ID
+		}
+		b.emit(ev.Data)
+		return nil
+	})
+	if err != nil && ctx.Err() == nil {
+		b.log().Debug("GET stream ended; will reconnect", "error", err)
+	}
+	return gotEvents, ctx.Err() == nil
 }
 
 // Shutdown best-effort terminates the upstream session with an HTTP
