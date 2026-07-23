@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -23,8 +24,11 @@ import (
 var version = "dev"
 
 const (
-	exitOK          = 0
+	exitOK = 0
+	// exitFatalError covers bad configuration and unrecoverable
+	// runtime failures (e.g. stdin read errors).
 	exitConfigError = 1
+	exitFatalError  = 1
 	exitAuthError   = 2
 )
 
@@ -45,12 +49,23 @@ func run() int {
 		credentials    = fs.String("credentials", envOr("IAP_MCP_CREDENTIALS", "auto"), "credential source: auto, adc, impersonate, oauth")
 		impersonateSA  = fs.String("impersonate-service-account", envOr("IAP_MCP_IMPERSONATE_SA", ""), "service account email to impersonate (implies --credentials=impersonate)")
 		downstreamAuth = fs.String("downstream-auth", envOr("IAP_MCP_DOWNSTREAM_AUTH", ""), "value forwarded as the upstream Authorization header; supports env:VAR_NAME indirection")
-		refreshMargin  = fs.Duration("refresh-margin", 5*time.Minute, "refresh the ID token this long before expiry")
-		timeout        = fs.Duration("timeout", 120*time.Second, "upstream timeout: total for JSON responses, idle (between reads) for SSE streams")
+		refreshMargin  = fs.Duration("refresh-margin", 5*time.Minute, "refresh the ID token this long before expiry (env IAP_MCP_REFRESH_MARGIN)")
+		timeout        = fs.Duration("timeout", 120*time.Second, "upstream timeout: total for JSON responses, idle (between reads) for SSE streams (env IAP_MCP_TIMEOUT)")
 		logLevel       = fs.String("log-level", envOr("IAP_MCP_LOG", "warn"), "log level: debug, info, warn, error")
 		showVersion    = fs.Bool("version", false, "print version and exit")
 	)
 	if err := fs.Parse(os.Args[1:]); err != nil {
+		return exitConfigError
+	}
+	// Duration flags accept env fallbacks too; an explicit flag wins.
+	if err := applyDurationEnv(fs, map[string]*time.Duration{
+		"refresh-margin": refreshMargin,
+		"timeout":        timeout,
+	}, map[string]string{
+		"refresh-margin": "IAP_MCP_REFRESH_MARGIN",
+		"timeout":        "IAP_MCP_TIMEOUT",
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "iap-mcp-proxy:", err)
 		return exitConfigError
 	}
 	if *showVersion {
@@ -150,10 +165,33 @@ func run() int {
 	defer cancel()
 	b.Shutdown(shCtx)
 
-	if runErr != nil && runErr != context.Canceled {
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		logger.Error("bridge terminated", "error", runErr)
+		return exitFatalError
 	}
 	return exitOK
+}
+
+// applyDurationEnv overrides duration flags from env vars when the
+// flag was not set explicitly on the command line.
+func applyDurationEnv(fs *flag.FlagSet, flags map[string]*time.Duration, envs map[string]string) error {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	for name, dst := range flags {
+		if set[name] {
+			continue
+		}
+		v := os.Getenv(envs[name])
+		if v == "" {
+			continue
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid %s value %q: %v", envs[name], v, err)
+		}
+		*dst = d
+	}
+	return nil
 }
 
 // resolveDownstreamAuth resolves env:VAR_NAME indirection so secrets

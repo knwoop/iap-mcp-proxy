@@ -3,6 +3,7 @@
 package iap
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,14 +43,11 @@ func isGoogleSignInRedirect(resp *http.Response) bool {
 }
 
 // ActionableMessage renders a one-line, actionable description of an
-// IAP auth/authz failure, suitable for stderr. It may consume up to
-// 4 KiB of the response body to look for IAP's error text.
+// IAP auth/authz failure, suitable for stderr. It peeks at up to 4 KiB
+// of the response body to look for IAP's error text, then reattaches
+// what it read so later readers still see the full body.
 func ActionableMessage(resp *http.Response, audience string) string {
-	var body string
-	if resp.Body != nil {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		body = string(b)
-	}
+	body := peekBody(resp, 4<<10)
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized && strings.Contains(strings.ToLower(body), "audience"):
@@ -64,6 +62,31 @@ func ActionableMessage(resp *http.Response, audience string) string {
 		return fmt.Sprintf("upstream returned HTTP %d: %s", resp.StatusCode, firstLine(body))
 	}
 }
+
+// peekBody reads up to n bytes of the response body and reassembles
+// resp.Body so the caller's downstream readers see the complete body.
+func peekBody(resp *http.Response, n int64) string {
+	if resp.Body == nil {
+		return ""
+	}
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, n))
+	resp.Body = &prefixedBody{prefix: bytes.NewReader(b), rest: resp.Body}
+	return string(b)
+}
+
+type prefixedBody struct {
+	prefix *bytes.Reader
+	rest   io.ReadCloser
+}
+
+func (p *prefixedBody) Read(b []byte) (int, error) {
+	if p.prefix.Len() > 0 {
+		return p.prefix.Read(b)
+	}
+	return p.rest.Read(b)
+}
+
+func (p *prefixedBody) Close() error { return p.rest.Close() }
 
 func firstLine(s string) string {
 	s = strings.TrimSpace(s)

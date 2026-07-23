@@ -65,6 +65,20 @@ func TestActionableMessagePermissionDenied(t *testing.T) {
 	}
 }
 
+func TestActionableMessagePreservesBody(t *testing.T) {
+	body := "Invalid IAP credentials: JWT audience doesn't match this application"
+	resp := makeResp(401, nil, body)
+	_ = ActionableMessage(resp, "aud")
+
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rest) != body {
+		t.Errorf("body after peek = %q, want the full original %q", rest, body)
+	}
+}
+
 func TestActionableMessageRedirect(t *testing.T) {
 	resp := makeResp(302, map[string]string{"Location": "https://accounts.google.com/x"}, "")
 	msg := ActionableMessage(resp, "aud")

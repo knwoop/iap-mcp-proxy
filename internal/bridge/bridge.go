@@ -320,24 +320,36 @@ func (b *Bridge) emit(data []byte) {
 }
 
 // replyError surfaces a transport-level failure to the client as a
-// JSON-RPC error response, if the inbound message was a request (had
-// an id). Failures of notifications are only logged.
+// JSON-RPC error response for every request id in the inbound message
+// (batches, allowed by older protocol versions, get an array of error
+// responses). Failures of pure notifications are only logged.
 func (b *Bridge) replyError(inbound []byte, detail string) {
 	b.log().Error(detail)
-	var probe struct {
-		ID json.RawMessage `json:"id"`
-	}
-	if err := json.Unmarshal(inbound, &probe); err != nil || len(probe.ID) == 0 || string(probe.ID) == "null" {
+	ids, batch := requestIDs(inbound)
+	if len(ids) == 0 {
 		return
 	}
-	out, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      probe.ID,
-		"error": map[string]any{
-			"code":    -32603,
-			"message": "iap-mcp-proxy: " + detail,
-		},
-	})
+	errResp := func(id json.RawMessage) map[string]any {
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"error": map[string]any{
+				"code":    -32603,
+				"message": "iap-mcp-proxy: " + detail,
+			},
+		}
+	}
+	var payload any
+	if batch {
+		resps := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			resps = append(resps, errResp(id))
+		}
+		payload = resps
+	} else {
+		payload = errResp(ids[0])
+	}
+	out, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
@@ -345,6 +357,37 @@ func (b *Bridge) replyError(inbound []byte, detail string) {
 	defer b.writeMu.Unlock()
 	b.Stdout.Write(out)
 	io.WriteString(b.Stdout, "\n")
+}
+
+// requestIDs extracts the JSON-RPC request ids from a message, which
+// may be a single request or a batch array; notifications (no id, or
+// id null) are skipped.
+func requestIDs(msg []byte) (ids []json.RawMessage, batch bool) {
+	valid := func(id json.RawMessage) bool {
+		return len(id) > 0 && string(id) != "null"
+	}
+	msg = bytes.TrimSpace(msg)
+	if len(msg) > 0 && msg[0] == '[' {
+		var probes []struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if json.Unmarshal(msg, &probes) != nil {
+			return nil, true
+		}
+		for _, p := range probes {
+			if valid(p.ID) {
+				ids = append(ids, p.ID)
+			}
+		}
+		return ids, true
+	}
+	var probe struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if json.Unmarshal(msg, &probe) != nil || !valid(probe.ID) {
+		return nil, false
+	}
+	return []json.RawMessage{probe.ID}, false
 }
 
 // recoverSession transparently re-establishes an expired session by

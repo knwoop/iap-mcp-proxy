@@ -65,8 +65,8 @@ iap-mcp-proxy [flags] <UPSTREAM_URL>
 | `--credentials` | `IAP_MCP_CREDENTIALS` | `auto` | `auto`, `adc`, `impersonate`, `oauth`. |
 | `--impersonate-service-account` | `IAP_MCP_IMPERSONATE_SA` | — | SA email to impersonate (implies `--credentials=impersonate`). |
 | `--downstream-auth` | `IAP_MCP_DOWNSTREAM_AUTH` | — | Value forwarded as the upstream `Authorization` header. Supports `env:VAR_NAME` indirection so secrets stay out of client config files. |
-| `--refresh-margin` | — | `5m` | Refresh the ID token this long before expiry. |
-| `--timeout` | — | `120s` | Upstream timeout: total for JSON responses, idle (time between reads) for SSE streams — so long-running streaming tool calls are not killed while data or keepalives keep arriving. |
+| `--refresh-margin` | `IAP_MCP_REFRESH_MARGIN` | `5m` | Refresh the ID token this long before expiry. |
+| `--timeout` | `IAP_MCP_TIMEOUT` | `120s` | Upstream timeout: total for JSON responses, idle (time between reads) for SSE streams — so long-running streaming tool calls are not killed while data or keepalives keep arriving. |
 | `--log-level` | `IAP_MCP_LOG` | `warn` | `debug` / `info` / `warn` / `error`. Logs go to stderr only. |
 | `--version` | — | — | Print version and exit. |
 
@@ -87,7 +87,7 @@ The principal must hold `roles/iap.httpsResourceAccessor` on the IAP resource.
 - If the upstream reports the session expired (HTTP 404 — e.g. after a Cloud Run redeploy), the proxy transparently replays the cached `initialize` handshake to obtain a fresh session and retries the request; the stdio client never notices.
 - If a streaming (SSE) response drops mid-tool-call and the server tags events with IDs, the proxy resumes it with `Last-Event-ID` instead of losing the response.
 - After `initialize`, the proxy opens the standalone GET SSE stream so server-initiated messages (`notifications/tools/list_changed`, sampling/elicitation requests, log notifications) reach the client, reconnecting with `Last-Event-ID` if the stream drops. Servers that respond 405 (no standalone stream) are handled silently.
-- Exit codes: `0` clean shutdown, `1` fatal config error, `2` auth bootstrap failure.
+- Exit codes: `0` clean shutdown, `1` fatal error (bad configuration or unrecoverable runtime failure), `2` auth bootstrap failure.
 
 See [`docs/setup-gcp.md`](docs/setup-gcp.md) for setting up IAP in both deployment modes (direct Cloud Run IAP and IAP behind a global external Application Load Balancer).
 

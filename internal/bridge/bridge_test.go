@@ -299,6 +299,40 @@ func TestBridgeStandaloneGETStream(t *testing.T) {
 	}
 }
 
+func TestBridgeBatchTransportErrorRepliesPerID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	out := &syncBuffer{}
+	b := &Bridge{
+		Upstream: srv.URL,
+		Client:   &http.Client{},
+		Timeout:  2 * time.Second,
+		Stdin: strings.NewReader(`[{"jsonrpc":"2.0","id":10,"method":"a"},{"jsonrpc":"2.0","method":"note"},{"jsonrpc":"2.0","id":11,"method":"b"}]` + "\n"),
+		Stdout: out,
+	}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var batch []map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &batch); err != nil {
+		t.Fatalf("stdout is not a JSON array: %q", out.String())
+	}
+	var gotIDs []float64
+	for _, m := range batch {
+		if _, ok := m["error"].(map[string]any); !ok {
+			t.Errorf("batch entry missing error object: %v", m)
+		}
+		gotIDs = append(gotIDs, m["id"].(float64))
+	}
+	if diff := cmp.Diff([]float64{10, 11}, gotIDs); diff != "" {
+		t.Errorf("error response ids mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestBridgeResumesDroppedSSEResponse(t *testing.T) {
 	var mu sync.Mutex
 	var resumeIDs []string
