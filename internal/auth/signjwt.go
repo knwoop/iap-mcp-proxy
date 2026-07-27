@@ -24,7 +24,6 @@ import (
 // the IAP resource.
 type signJWTSource struct {
 	svc      *iamcredentials.Service
-	name     string // projects/-/serviceAccounts/<email>
 	sa       string
 	audience string
 	now      func() time.Time
@@ -37,7 +36,6 @@ func newSignJWTSource(ctx context.Context, sa, audience string) (Source, error) 
 	}
 	return &signJWTSource{
 		svc:      svc,
-		name:     "projects/-/serviceAccounts/" + sa,
 		sa:       sa,
 		audience: audience,
 		now:      time.Now,
@@ -49,8 +47,9 @@ func (s *signJWTSource) Token(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	name := "projects/-/serviceAccounts/" + s.sa
 	resp, err := s.svc.Projects.ServiceAccounts.
-		SignJwt(s.name, &iamcredentials.SignJwtRequest{Payload: payload}).
+		SignJwt(name, &iamcredentials.SignJwtRequest{Payload: payload}).
 		Context(ctx).Do()
 	if err != nil {
 		return "", fmt.Errorf("signing JWT as %s: %w (does the caller have roles/iam.serviceAccountTokenCreator on it?)", s.sa, err)

@@ -55,6 +55,11 @@ func TestActionableMessageAudienceMismatch(t *testing.T) {
 	if !strings.Contains(msg, "--audience") || !strings.Contains(msg, "apps.googleusercontent.com") {
 		t.Errorf("message not actionable for audience mismatch: %q", msg)
 	}
+	// Users hitting this with an OIDC mode against managed Cloud Run IAP
+	// need signjwt, not an OAuth client ID — the hint must point there.
+	if !strings.Contains(msg, "signjwt") {
+		t.Errorf("audience-mismatch message should hint at --credentials=signjwt: %q", msg)
+	}
 }
 
 func TestActionableMessagePermissionDenied(t *testing.T) {

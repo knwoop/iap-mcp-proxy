@@ -45,7 +45,7 @@ func run() int {
 	}
 
 	var (
-		audience       = fs.String("audience", envOr("IAP_MCP_AUDIENCE", ""), "token audience: IAP OAuth client ID (LB-backed IAP) or service URL (OIDC modes). Default: origin of UPSTREAM_URL, or origin+\"/*\" for signjwt.")
+		audience       = fs.String("audience", envOr("IAP_MCP_AUDIENCE", ""), "token audience: IAP OAuth client ID (LB-backed IAP) or service URL (OIDC modes). Default: origin of UPSTREAM_URL, or the exact upstream endpoint for signjwt (pass <origin>/* to cover all paths).")
 		credentials    = fs.String("credentials", envOr("IAP_MCP_CREDENTIALS", "auto"), "credential source: auto, adc, impersonate, oauth, signjwt")
 		impersonateSA  = fs.String("impersonate-service-account", envOr("IAP_MCP_IMPERSONATE_SA", ""), "target service account email (impersonate mode signs an ID token; signjwt mode signs a self-signed JWT)")
 		downstreamAuth = fs.String("downstream-auth", envOr("IAP_MCP_DOWNSTREAM_AUTH", ""), "value forwarded as the upstream Authorization header; supports env:VAR_NAME indirection")
@@ -98,8 +98,9 @@ func run() int {
 	// Audience derivation depends on the mode: the OIDC modes use the
 	// upstream origin (correct for a custom-OAuth-client / LB-backed
 	// IAP the client ID must still be passed explicitly), while signjwt
-	// needs the canonical run.app URL plus "/*", which origin-only is
-	// not — auto-managed IAP rejects origin-only.
+	// uses the exact upstream endpoint (the canonical run.app URL with
+	// its path) for least privilege — origin-only is rejected by
+	// auto-managed IAP anyway.
 	aud := *audience
 	if aud == "" {
 		aud = defaultAudience(mode, u)
@@ -197,13 +198,19 @@ func applyDurationEnv(fs *flag.FlagSet, flags map[string]*time.Duration, envs ma
 }
 
 // defaultAudience derives the token audience from the upstream URL when
-// --audience is not given. signjwt mode needs the canonical run.app URL
-// plus "/*" (origin-only and the project-number URL are rejected by
-// auto-managed IAP); the OIDC modes use the origin.
+// --audience is not given. signjwt defaults to the exact upstream
+// endpoint (e.g. https://svc-xxxx-an.a.run.app/mcp) for least privilege
+// — a leaked token is then scoped to that one path; pass
+// --audience <origin>/* to cover every path. A pathless upstream falls
+// back to the "/*" wildcard, since origin-only (and the project-number
+// URL) are rejected by auto-managed IAP. The OIDC modes use the origin.
 func defaultAudience(mode string, u *url.URL) string {
 	origin := u.Scheme + "://" + u.Host
 	if mode == "signjwt" {
-		return origin + "/*"
+		if u.Path == "" || u.Path == "/" {
+			return origin + "/*"
+		}
+		return origin + u.Path
 	}
 	return origin
 }

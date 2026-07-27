@@ -19,9 +19,12 @@ gcloud beta iap web add-iam-policy-binding \
   --service=MY-MCP-SERVICE
 ```
 
-`gcloud ... --iap` enables IAP with Google's **auto-managed OAuth client**. This client **rejects Google-issued OIDC ID tokens** (`adc`/`impersonate`/`oauth` modes) — every audience format returns `Invalid IAP credentials: Invalid JWT audience`. You must use a **self-signed service-account JWT** (`--credentials=signjwt`):
+`gcloud ... --iap` enables IAP with Google's **auto-managed OAuth client**. This client **rejects Google-issued OIDC ID tokens** (`adc`/`impersonate`/`oauth` modes) — every audience format returns `Invalid IAP credentials: Invalid JWT audience`. The simplest way in is a **self-signed service-account JWT** (`--credentials=signjwt`), which needs no OAuth client at all:
 
 ```sh
+# Enable the Service Account Credentials API (required for signJwt).
+gcloud services enable iamcredentials.googleapis.com
+
 # Grant your ADC identity permission to sign as the SA, and the SA
 # access to the IAP resource.
 gcloud iam service-accounts add-iam-policy-binding \
@@ -44,9 +47,9 @@ iap-mcp-proxy \
   "${CANONICAL_URL}/mcp"
 ```
 
-Audience: defaults to the canonical origin plus `/*` (e.g. `https://my-mcp-xxxx.a.run.app/*`). Origin-only and the project-number URL are **not** accepted; override `--audience` only to use the exact request path instead.
+Audience: defaults to the exact upstream endpoint (e.g. `https://my-mcp-xxxx.a.run.app/mcp`), which scopes a leaked token to that one path. Origin-only and the project-number URL are **not** accepted; pass `--audience <canonical-origin>/*` if you want the token to cover all paths on the service.
 
-> Older direct-Cloud-Run IAP created with a **custom OAuth client** (before the OAuth Admin API shutdown) still takes OIDC ID tokens — use `--credentials=impersonate`/`adc` with the service URL as `--audience` there. New deployments cannot create such a client and must use `signjwt`.
+> `signjwt` is the simplest route because it needs no OAuth client. Managed-client IAP can *also* accept OIDC ID tokens if you configure a separate allow-listed OAuth client (see [custom OAuth configuration](https://cloud.google.com/iap/docs/custom-oauth-configuration)); with such a client you can use `--credentials=impersonate`/`adc` and the client ID as `--audience`. Older direct-Cloud-Run IAP created with a custom client works the same way.
 
 ## Mode B — IAP behind a global external Application Load Balancer
 
