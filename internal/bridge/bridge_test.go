@@ -227,6 +227,9 @@ func TestBridgeStandaloneGETStream(t *testing.T) {
 		lastIDs  []string
 		sessions []string
 	)
+	// Closed when the reconnect (second GET) arrives, giving the test a
+	// deterministic signal to wait on instead of polling.
+	reconnected := make(chan struct{})
 	f.getHandler = func(w http.ResponseWriter, r *http.Request) {
 		streamMu.Lock()
 		lastIDs = append(lastIDs, r.Header.Get("Last-Event-ID"))
@@ -239,6 +242,9 @@ func TestBridgeStandaloneGETStream(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			fmt.Fprint(w, "id: 5\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n")
 			return
+		}
+		if n == 2 {
+			close(reconnected)
 		}
 		// Reconnections: signal that no stream is offered anymore.
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -267,22 +273,19 @@ func TestBridgeStandaloneGETStream(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Run returns at stdin EOF while the listener keeps working; wait
-	// for the notification to be relayed and the reconnect to happen.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		streamMu.Lock()
-		reconnected := len(lastIDs) >= 2
-		streamMu.Unlock()
-		if reconnected && strings.Contains(out.String(), "notifications/tools/list_changed") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out; GET connects: %v, stdout: %q", lastIDs, out.String())
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Run returns at stdin EOF while the listener keeps working. The
+	// reconnect only happens after the first stream's events have been
+	// relayed, so once it fires the notification is already on stdout.
+	select {
+	case <-reconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for reconnect; GET connects: %v, stdout: %q", lastIDs, out.String())
 	}
 	cancel()
+
+	if !strings.Contains(out.String(), "notifications/tools/list_changed") {
+		t.Errorf("server-initiated notification not relayed to stdout: %q", out.String())
+	}
 
 	streamMu.Lock()
 	defer streamMu.Unlock()
@@ -389,15 +392,35 @@ func TestBridgeResumesDroppedSSEResponse(t *testing.T) {
 }
 
 func TestBridgeTimeoutIsIdleNotTotalForSSE(t *testing.T) {
-	// The stream stays active for well over --timeout, but no single
-	// gap between events exceeds it: the call must survive.
+	// A total deadline of `timeout` would kill this stream partway
+	// through; an idle timeout that resets on each read keeps it alive
+	// because no single gap between events approaches `timeout`.
+	//
+	// Pacing is driven by the test, not by blind server sleeps: the
+	// server flushes an event, then blocks until the test — after
+	// confirming that event reached stdout (so the bridge read it and
+	// reset its watchdog) and waiting a controlled idle `gap` — signals
+	// for the next one. Every wait is bounded, and the cumulative
+	// wall-clock time exceeds `timeout` while each gap stays well under
+	// it. Nothing depends on unverified scheduler timing.
+	const (
+		timeout    = 300 * time.Millisecond
+		gap        = timeout / 3 // controlled idle between events, << timeout
+		keepalives = 4           // 4*gap > timeout, so a total deadline would fire first
+	)
+
+	release := make(chan struct{})
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
-		for i := 1; i <= 5; i++ {
+		for i := 1; i <= keepalives; i++ {
 			fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":%d}}\n\n", i)
 			fl.Flush()
-			time.Sleep(60 * time.Millisecond)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
 		}
 		fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"done\":true}}\n\n")
 	})
@@ -408,19 +431,56 @@ func TestBridgeTimeoutIsIdleNotTotalForSSE(t *testing.T) {
 	b := &Bridge{
 		Upstream: srv.URL + "/mcp",
 		Client:   &http.Client{},
-		Timeout:  200 * time.Millisecond, // < 300ms total stream duration
+		Timeout:  timeout,
 		Stdin:    strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/call"}` + "\n"),
 		Stdout:   out,
 	}
+
+	driverDone := make(chan struct{})
+	go func() {
+		defer close(driverDone)
+		for i := 1; i <= keepalives; i++ {
+			// Confirm the bridge actually read progress i (resetting the
+			// idle watchdog) before starting the next idle interval.
+			if !waitForCount(out, "notifications/progress", i, timeout) {
+				t.Errorf("progress %d not seen within %v; stream was killed early: %q", i, timeout, out.String())
+				return
+			}
+			time.Sleep(gap) // controlled idle, safely below timeout
+			select {
+			case release <- struct{}{}:
+			case <-time.After(timeout):
+				t.Errorf("server did not consume release %d", i)
+				return
+			}
+		}
+	}()
+
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	<-driverDone
 
 	if !strings.Contains(out.String(), `"result":{"done":true}`) {
-		t.Errorf("final response missing — stream was killed by total deadline: %q", out.String())
+		t.Errorf("final response missing — stream was killed by a total deadline: %q", out.String())
 	}
-	if got := strings.Count(out.String(), "notifications/progress"); got != 5 {
-		t.Errorf("want 5 progress notifications, got %d: %q", got, out.String())
+	if got := strings.Count(out.String(), "notifications/progress"); got != keepalives {
+		t.Errorf("want %d progress notifications, got %d: %q", keepalives, got, out.String())
+	}
+}
+
+// waitForCount reports whether substr appears at least n times in out
+// before the deadline, using bounded polling so it can never hang.
+func waitForCount(out *syncBuffer, substr string, n int, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for {
+		if strings.Count(out.String(), substr) >= n {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
