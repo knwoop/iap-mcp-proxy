@@ -2,7 +2,7 @@
 
 A client-side bridge that lets generic MCP clients (Claude Desktop, Claude Code, Cursor, ...) connect to remote MCP servers protected by **Google Cloud Identity-Aware Proxy (IAP)**.
 
-The GCP counterpart to [`aws/mcp-proxy-for-aws`](https://github.com/aws/mcp-proxy-for-aws).
+The Google Cloud counterpart to [`aws/mcp-proxy-for-aws`](https://github.com/aws/mcp-proxy-for-aws).
 
 ```
 ┌──────────────┐        stdio          ┌───────────────┐   HTTPS + ID token   ┌─────┐      ┌────────────┐
