@@ -206,13 +206,19 @@ func applyDurationEnv(fs *flag.FlagSet, flags map[string]*time.Duration, envs ma
 // URL) are rejected by auto-managed IAP. The OIDC modes use the origin.
 func defaultAudience(mode string, u *url.URL) string {
 	origin := u.Scheme + "://" + u.Host
-	if mode == "signjwt" {
-		if u.Path == "" || u.Path == "/" {
-			return origin + "/*"
-		}
-		return origin + u.Path
+	if mode != "signjwt" {
+		return origin
 	}
-	return origin
+	// Use EscapedPath, not u.Path: u.Path is percent-decoded, so an
+	// upstream like /mcp%2Fv1 would otherwise become the different
+	// endpoint /mcp/v1. IAP matches the audience on the resource path,
+	// so the query string and fragment — neither part of the resource
+	// identity — are intentionally excluded here.
+	path := u.EscapedPath()
+	if path == "" || path == "/" {
+		return origin + "/*"
+	}
+	return origin + path
 }
 
 // resolveDownstreamAuth resolves env:VAR_NAME indirection so secrets

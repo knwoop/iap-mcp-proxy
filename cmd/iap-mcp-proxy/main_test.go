@@ -14,6 +14,12 @@ func TestDefaultAudience(t *testing.T) {
 		// signjwt defaults to the exact upstream endpoint (least
 		// privilege); the path is kept.
 		{"signjwt", "https://svc-xxxx-an.a.run.app/mcp", "https://svc-xxxx-an.a.run.app/mcp"},
+		// The escaped path is preserved verbatim (u.Path would decode
+		// %2F and collapse this to /mcp/v1).
+		{"signjwt", "https://svc-xxxx-an.a.run.app/mcp%2Fv1", "https://svc-xxxx-an.a.run.app/mcp%2Fv1"},
+		// Query and fragment are excluded from the audience.
+		{"signjwt", "https://svc-xxxx-an.a.run.app/mcp?foo=bar", "https://svc-xxxx-an.a.run.app/mcp"},
+		{"signjwt", "https://svc-xxxx-an.a.run.app/mcp#frag", "https://svc-xxxx-an.a.run.app/mcp"},
 		// A pathless (or root) upstream falls back to the "/*" wildcard,
 		// since origin-only is rejected by auto-managed IAP.
 		{"signjwt", "https://svc-xxxx-an.a.run.app", "https://svc-xxxx-an.a.run.app/*"},
