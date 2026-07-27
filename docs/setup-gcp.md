@@ -19,13 +19,34 @@ gcloud beta iap web add-iam-policy-binding \
   --service=MY-MCP-SERVICE
 ```
 
-Audience: the service URL (e.g. `https://my-mcp-xxxx.a.run.app`). This is what the proxy derives by default from the upstream URL, so `--audience` can usually be omitted:
+`gcloud ... --iap` enables IAP with Google's **auto-managed OAuth client**. This client **rejects Google-issued OIDC ID tokens** (`adc`/`impersonate`/`oauth` modes) — every audience format returns `Invalid IAP credentials: Invalid JWT audience`. You must use a **self-signed service-account JWT** (`--credentials=signjwt`):
 
 ```sh
-iap-mcp-proxy https://my-mcp-xxxx.a.run.app/mcp
+# Grant your ADC identity permission to sign as the SA, and the SA
+# access to the IAP resource.
+gcloud iam service-accounts add-iam-policy-binding \
+  mcp-caller@PROJECT.iam.gserviceaccount.com \
+  --member="user:you@example.com" \
+  --role="roles/iam.serviceAccountTokenCreator"
+
+gcloud beta iap web add-iam-policy-binding \
+  --member="serviceAccount:mcp-caller@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/iap.httpsResourceAccessor" \
+  --region=REGION --resource-type=cloud-run --service=MY-MCP-SERVICE
+
+# Use the CANONICAL run.app URL (status.url), not the project-number URL.
+CANONICAL_URL="$(gcloud run services describe MY-MCP-SERVICE \
+  --region=REGION --format='value(status.url)')"
+
+iap-mcp-proxy \
+  --credentials=signjwt \
+  --impersonate-service-account mcp-caller@PROJECT.iam.gserviceaccount.com \
+  "${CANONICAL_URL}/mcp"
 ```
 
-> Note: some setups require the project-number-based URL form as the audience. If you get a 401 with an audience error, check the exact audience IAP reports in the error body and pass it explicitly.
+Audience: defaults to the canonical origin plus `/*` (e.g. `https://my-mcp-xxxx.a.run.app/*`). Origin-only and the project-number URL are **not** accepted; override `--audience` only to use the exact request path instead.
+
+> Older direct-Cloud-Run IAP created with a **custom OAuth client** (before the OAuth Admin API shutdown) still takes OIDC ID tokens — use `--credentials=impersonate`/`adc` with the service URL as `--audience` there. New deployments cannot create such a client and must use `signjwt`.
 
 ## Mode B — IAP behind a global external Application Load Balancer
 

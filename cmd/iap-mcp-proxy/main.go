@@ -45,9 +45,9 @@ func run() int {
 	}
 
 	var (
-		audience       = fs.String("audience", envOr("IAP_MCP_AUDIENCE", ""), "OIDC token audience: IAP OAuth client ID (LB-backed IAP) or service URL (direct Cloud Run IAP). Default: origin of UPSTREAM_URL.")
-		credentials    = fs.String("credentials", envOr("IAP_MCP_CREDENTIALS", "auto"), "credential source: auto, adc, impersonate, oauth")
-		impersonateSA  = fs.String("impersonate-service-account", envOr("IAP_MCP_IMPERSONATE_SA", ""), "service account email to impersonate (implies --credentials=impersonate)")
+		audience       = fs.String("audience", envOr("IAP_MCP_AUDIENCE", ""), "token audience: IAP OAuth client ID (LB-backed IAP) or service URL (OIDC modes). Default: origin of UPSTREAM_URL, or origin+\"/*\" for signjwt.")
+		credentials    = fs.String("credentials", envOr("IAP_MCP_CREDENTIALS", "auto"), "credential source: auto, adc, impersonate, oauth, signjwt")
+		impersonateSA  = fs.String("impersonate-service-account", envOr("IAP_MCP_IMPERSONATE_SA", ""), "target service account email (impersonate mode signs an ID token; signjwt mode signs a self-signed JWT)")
 		downstreamAuth = fs.String("downstream-auth", envOr("IAP_MCP_DOWNSTREAM_AUTH", ""), "value forwarded as the upstream Authorization header; supports env:VAR_NAME indirection")
 		refreshMargin  = fs.Duration("refresh-margin", 5*time.Minute, "refresh the ID token this long before expiry (env IAP_MCP_REFRESH_MARGIN)")
 		timeout        = fs.Duration("timeout", 120*time.Second, "upstream timeout: total for JSON responses, idle (between reads) for SSE streams (env IAP_MCP_TIMEOUT)")
@@ -90,24 +90,26 @@ func run() int {
 		return exitConfigError
 	}
 
-	// Audience derivation: default to the upstream origin, which is
-	// correct for direct Cloud Run IAP. LB-backed IAP needs the IAP
-	// OAuth client ID passed explicitly.
+	mode := *credentials
+	if *impersonateSA != "" && (mode == "auto" || mode == "") {
+		mode = "impersonate"
+	}
+
+	// Audience derivation depends on the mode: the OIDC modes use the
+	// upstream origin (correct for a custom-OAuth-client / LB-backed
+	// IAP the client ID must still be passed explicitly), while signjwt
+	// needs the canonical run.app URL plus "/*", which origin-only is
+	// not — auto-managed IAP rejects origin-only.
 	aud := *audience
 	if aud == "" {
-		aud = u.Scheme + "://" + u.Host
-		logger.Info("no --audience given; derived from upstream origin (correct for direct Cloud Run IAP; LB-backed IAP needs the IAP OAuth client ID)", "audience", aud)
+		aud = defaultAudience(mode, u)
+		logger.Info("no --audience given; derived from upstream URL", "mode", mode, "audience", aud)
 	}
 
 	downstream, err := resolveDownstreamAuth(*downstreamAuth)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iap-mcp-proxy:", err)
 		return exitConfigError
-	}
-
-	mode := *credentials
-	if *impersonateSA != "" && (mode == "auto" || mode == "") {
-		mode = "impersonate"
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -192,6 +194,18 @@ func applyDurationEnv(fs *flag.FlagSet, flags map[string]*time.Duration, envs ma
 		*dst = d
 	}
 	return nil
+}
+
+// defaultAudience derives the token audience from the upstream URL when
+// --audience is not given. signjwt mode needs the canonical run.app URL
+// plus "/*" (origin-only and the project-number URL are rejected by
+// auto-managed IAP); the OIDC modes use the origin.
+func defaultAudience(mode string, u *url.URL) string {
+	origin := u.Scheme + "://" + u.Host
+	if mode == "signjwt" {
+		return origin + "/*"
+	}
+	return origin
 }
 
 // resolveDownstreamAuth resolves env:VAR_NAME indirection so secrets
