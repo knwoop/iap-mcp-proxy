@@ -1,0 +1,97 @@
+name: verify
+
+# Reusable verification suite shared by CI (on PRs/pushes) and release
+# (as a gate before publishing). All jobs are read-only and receive no
+# secrets, so they are safe to run against untrusted pull requests.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  race:
+    name: vet + race test (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test -race ./...
+
+  cross:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Race detection stays on Linux (job above); macOS and Windows
+        # verify compilation and behavior of the platform-specific
+        # keyring/browser paths without the cost/instability of -race
+        # everywhere.
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go test ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - run: govulncheck ./...
+
+  tidy:
+    name: reproducibility (go mod tidy + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go mod tidy
+      - name: fail if go.mod/go.sum are not tidy
+        run: git diff --exit-code go.mod go.sum
+      - run: go build ./...
+
+  snapshot:
+    name: goreleaser snapshot build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.17.1
+          args: release --snapshot --clean

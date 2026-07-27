@@ -4,21 +4,41 @@ on:
   push:
     tags: ["v*"]
 
+# Read-only at the top level; only the publishing job below is granted
+# contents: write.
 permissions:
-  contents: write
+  contents: read
+
+# Never cancel an in-flight release, and keep releases for different
+# tags independent (each tag is a distinct ref, so a distinct group).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  goreleaser:
+  # Gate: the full verification suite must pass before anything is
+  # published. Runs read-only with no secrets.
+  verify:
+    uses: ./.github/workflows/verify.yaml
+    permissions:
+      contents: read
+
+  release:
+    needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
+          version: v2.17.1
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

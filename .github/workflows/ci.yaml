@@ -5,48 +5,19 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only by default; the verification suite needs nothing more.
 permissions:
   contents: read
 
+# Cancel superseded CI runs for the same PR or branch. Keyed by
+# head_ref on PRs (so pushes to a PR cancel its in-flight run) and by
+# ref otherwise.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go test -race ./...
-      - run: go vet ./...
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v8
-
-  govulncheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - run: govulncheck ./...
-
-  snapshot:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          args: release --snapshot --clean
+  verify:
+    uses: ./.github/workflows/verify.yaml
+    permissions:
+      contents: read
