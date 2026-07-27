@@ -62,8 +62,8 @@ iap-mcp-proxy [flags] <UPSTREAM_URL>
 | Flag | Env var | Default | Description |
 |---|---|---|---|
 | `--audience` | `IAP_MCP_AUDIENCE` | origin of `UPSTREAM_URL` | OIDC token audience. LB-backed IAP: the IAP OAuth client ID (`NNN.apps.googleusercontent.com`). Direct Cloud Run IAP: depends on the OAuth client — see [Supported IAP configurations](#supported-iap-configurations). |
-| `--credentials` | `IAP_MCP_CREDENTIALS` | `auto` | `auto`, `adc`, `impersonate`, `oauth`. |
-| `--impersonate-service-account` | `IAP_MCP_IMPERSONATE_SA` | — | SA email to impersonate (implies `--credentials=impersonate`). |
+| `--credentials` | `IAP_MCP_CREDENTIALS` | `auto` | `auto`, `adc`, `impersonate`, `oauth`, `signjwt`. |
+| `--impersonate-service-account` | `IAP_MCP_IMPERSONATE_SA` | — | Target SA email. `impersonate` mints an ID token as it; `signjwt` signs a self-signed JWT as it. |
 | `--downstream-auth` | `IAP_MCP_DOWNSTREAM_AUTH` | — | Value forwarded as the upstream `Authorization` header. Supports `env:VAR_NAME` indirection so secrets stay out of client config files. |
 | `--refresh-margin` | `IAP_MCP_REFRESH_MARGIN` | `5m` | Refresh the ID token this long before expiry. |
 | `--timeout` | `IAP_MCP_TIMEOUT` | `120s` | Upstream timeout: total for JSON responses, idle (time between reads) for SSE streams — so long-running streaming tool calls are not killed while data or keepalives keep arriving. |
@@ -78,6 +78,8 @@ With `--credentials=auto` (the default), sources are tried in this order:
 2. **ADC** — if Application Default Credentials are a service account key or workload credential, mint an ID token directly.
 3. **Desktop OAuth** — gcloud *user* credentials can't mint arbitrary-audience ID tokens, so the proxy falls back to an installed-app OAuth flow: first run opens a browser for Google sign-in; the refresh token is stored in your OS keychain (fallback: `0600` file under your user config dir). Requires a desktop OAuth client in the same project as the IAP resource, supplied via `IAP_MCP_OAUTH_CLIENT_ID` / `IAP_MCP_OAUTH_CLIENT_SECRET` — see [Google's docs on programmatic IAP authentication](https://cloud.google.com/iap/docs/authentication-howto).
 
+These OIDC modes need IAP to use a **custom** OAuth client (LB-backed IAP, or a managed-client service with a separate allow-listed OAuth client). For modern managed-client direct Cloud Run IAP, `--credentials=signjwt` is the simplest route — it needs no OAuth client (see [Supported IAP configurations](#supported-iap-configurations)).
+
 The principal must hold `roles/iap.httpsResourceAccessor` on the IAP resource.
 
 ## Supported IAP configurations
@@ -87,11 +89,11 @@ Which credential the proxy must present depends on how IAP is deployed — above
 | IAP deployment | OAuth client | Token the proxy sends | `--audience` | Status |
 |---|---|---|---|---|
 | Behind an external HTTPS load balancer | Custom | OIDC ID token (`impersonate` / `adc` / `oauth`) | IAP OAuth client ID (`NNN.apps.googleusercontent.com`) | ✅ Supported — OIDC acceptance verified against a live IAP |
-| Direct Cloud Run IAP | Google-managed (the default when you enable IAP today) | Self-signed service-account JWT | canonical `*.run.app` URL + `/*` | ❌ Not yet — IAP rejects OIDC tokens here; a self-signed-JWT mode is required |
+| Direct Cloud Run IAP | Google-managed (the default when you enable IAP today) | Self-signed service-account JWT (`signjwt`) | exact `*.run.app` endpoint (or `+ /*`) | ✅ Supported — IAP rejects OIDC tokens here, so use `--credentials=signjwt` |
 | Direct Cloud Run IAP | Custom / allow-listed | OIDC ID token | OAuth client ID | ⚠️ Expected to work, not yet verified |
 
-- Since Google shut down the IAP OAuth Admin API (March 2026), newly-secured apps default to a **Google-managed** OAuth client, and that configuration **rejects Google-issued OIDC ID tokens** (`Invalid IAP credentials: Invalid bearer token. Invalid JWT audience.`) for every audience. Programmatic access there needs a **self-signed service-account JWT** (`iss`=`sub`=SA email, signed via the IAM `signJwt` API) with the audience set to the canonical `run.app` URL plus a path or `/*` wildcard. This mode is not implemented yet.
-- New custom OAuth clients can no longer be created via API (console only); existing custom clients keep working.
+- Since Google shut down the IAP OAuth Admin API (March 2026), newly-secured apps default to a **Google-managed** OAuth client, and that configuration **rejects Google-issued OIDC ID tokens** (`Invalid IAP credentials: Invalid bearer token. Invalid JWT audience.`) for every audience. The simplest programmatic access is a **self-signed service-account JWT** (`iss`=`sub`=SA email, signed via the IAM `signJwt` API), audience set to the canonical `run.app` URL with a path or `/*` wildcard. Use `--credentials=signjwt --impersonate-service-account=<SA>`; `--audience` defaults to the exact upstream endpoint (pass `<origin>/*` to cover all paths). Requires the Service Account Credentials API (`gcloud services enable iamcredentials.googleapis.com`).
+- Managed-client IAP can *also* accept OIDC ID tokens via a separate **allow-listed** OAuth client (console-created; see [custom OAuth configuration](https://cloud.google.com/iap/docs/custom-oauth-configuration)) — then `--credentials=impersonate`/`adc` work with that client ID as `--audience`. New custom clients are console-only (no API); existing ones keep working.
 
 ## Notes
 

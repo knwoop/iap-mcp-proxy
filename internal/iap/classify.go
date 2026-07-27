@@ -51,9 +51,9 @@ func ActionableMessage(resp *http.Response, audience string) string {
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized && strings.Contains(strings.ToLower(body), "audience"):
-		return fmt.Sprintf("audience mismatch: token aud=%s but IAP rejected it; for load-balancer IAP pass --audience <NNN>.apps.googleusercontent.com (the IAP OAuth client ID)", audience)
+		return fmt.Sprintf("audience mismatch: token aud=%s rejected by IAP. Managed direct Cloud Run IAP (the default today) rejects OIDC ID tokens entirely — use --credentials=signjwt. For custom-client / load-balancer IAP, pass --audience <NNN>.apps.googleusercontent.com (the IAP OAuth client ID)", audience)
 	case resp.StatusCode == http.StatusUnauthorized:
-		return fmt.Sprintf("IAP rejected the ID token (aud=%s): verify the audience and that the token is a Google-issued OIDC ID token (IAP said: %s)", audience, firstLine(body))
+		return fmt.Sprintf("IAP rejected the token (aud=%s): for managed direct Cloud Run IAP use --credentials=signjwt (it rejects OIDC ID tokens); otherwise verify the audience and that the token is a Google-issued OIDC ID token (IAP said: %s)", audience, firstLine(body))
 	case resp.StatusCode == http.StatusForbidden && IsIAPResponse(resp):
 		return "permission denied: grant roles/iap.httpsResourceAccessor to the calling principal on the IAP resource"
 	case IsAuthFailure(resp):

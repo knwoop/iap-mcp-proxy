@@ -1,5 +1,7 @@
-// Package auth provides OIDC ID token sources for authenticating to
-// Google Cloud IAP, plus an http.RoundTripper that attaches them.
+// Package auth provides credential sources for authenticating to Google
+// Cloud IAP — Google-issued OIDC ID tokens (adc/impersonate/oauth) and
+// self-signed service-account JWTs (signjwt) — plus an
+// http.RoundTripper that attaches them.
 package auth
 
 import (
@@ -14,18 +16,23 @@ import (
 	"time"
 )
 
-// Source mints raw OIDC ID tokens for a fixed audience.
+// Source mints a raw bearer token (OIDC ID token or self-signed SA JWT)
+// for a fixed audience.
 type Source interface {
 	Token(ctx context.Context) (string, error)
 }
 
 // Config selects and configures a credential source.
 type Config struct {
-	// Mode is one of "auto", "adc", "impersonate", "oauth".
+	// Mode is one of "auto", "adc", "impersonate", "oauth", "signjwt".
 	Mode string
-	// Audience is the OIDC token audience (IAP client ID or service URL).
+	// Audience is the token audience: an IAP OAuth client ID or service
+	// URL for the OIDC modes, or the canonical run.app URL plus "/*"
+	// for signjwt.
 	Audience string
-	// ImpersonateSA is the service account email to impersonate.
+	// ImpersonateSA is the target service account email — impersonated
+	// for OIDC ID tokens (impersonate mode) or signed for self-signed
+	// JWTs (signjwt mode).
 	ImpersonateSA string
 	// OAuthClientID / OAuthClientSecret configure the desktop OAuth flow.
 	OAuthClientID     string
@@ -56,6 +63,11 @@ func NewSource(ctx context.Context, cfg Config) (*Cached, error) {
 			return nil, errors.New("--credentials=impersonate requires --impersonate-service-account")
 		}
 		src, err = newImpersonatedSource(ctx, cfg.ImpersonateSA, cfg.Audience)
+	case "signjwt":
+		if cfg.ImpersonateSA == "" {
+			return nil, errors.New("--credentials=signjwt requires --impersonate-service-account (the target service account to sign as)")
+		}
+		src, err = newSignJWTSource(ctx, cfg.ImpersonateSA, cfg.Audience)
 	case "adc":
 		src, err = newADCSource(ctx, cfg.Audience)
 	case "oauth":
@@ -74,7 +86,7 @@ func NewSource(ctx context.Context, cfg Config) (*Cached, error) {
 			}
 		}
 	default:
-		return nil, fmt.Errorf("unknown --credentials mode %q (want auto, adc, impersonate, or oauth)", cfg.Mode)
+		return nil, fmt.Errorf("unknown --credentials mode %q (want auto, adc, impersonate, oauth, or signjwt)", cfg.Mode)
 	}
 	if err != nil {
 		return nil, err
