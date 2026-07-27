@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Bump SHA-pinned GitHub Actions (Dependabot updates both the pinned
+  # commit SHA and its trailing version comment).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Go module dependencies, grouped into a single PR to keep noise low
+  # for a small repository.
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
