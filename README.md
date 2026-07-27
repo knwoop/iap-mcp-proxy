@@ -61,7 +61,7 @@ iap-mcp-proxy [flags] <UPSTREAM_URL>
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
-| `--audience` | `IAP_MCP_AUDIENCE` | origin of `UPSTREAM_URL` | OIDC token audience. LB-backed IAP: the IAP OAuth client ID (`NNN.apps.googleusercontent.com`). Direct Cloud Run IAP: the service URL (the default usually works). |
+| `--audience` | `IAP_MCP_AUDIENCE` | origin of `UPSTREAM_URL` | OIDC token audience. LB-backed IAP: the IAP OAuth client ID (`NNN.apps.googleusercontent.com`). Direct Cloud Run IAP: depends on the OAuth client — see [Supported IAP configurations](#supported-iap-configurations). |
 | `--credentials` | `IAP_MCP_CREDENTIALS` | `auto` | `auto`, `adc`, `impersonate`, `oauth`. |
 | `--impersonate-service-account` | `IAP_MCP_IMPERSONATE_SA` | — | SA email to impersonate (implies `--credentials=impersonate`). |
 | `--downstream-auth` | `IAP_MCP_DOWNSTREAM_AUTH` | — | Value forwarded as the upstream `Authorization` header. Supports `env:VAR_NAME` indirection so secrets stay out of client config files. |
@@ -79,6 +79,19 @@ With `--credentials=auto` (the default), sources are tried in this order:
 3. **Desktop OAuth** — gcloud *user* credentials can't mint arbitrary-audience ID tokens, so the proxy falls back to an installed-app OAuth flow: first run opens a browser for Google sign-in; the refresh token is stored in your OS keychain (fallback: `0600` file under your user config dir). Requires a desktop OAuth client in the same project as the IAP resource, supplied via `IAP_MCP_OAUTH_CLIENT_ID` / `IAP_MCP_OAUTH_CLIENT_SECRET` — see [Google's docs on programmatic IAP authentication](https://cloud.google.com/iap/docs/authentication-howto).
 
 The principal must hold `roles/iap.httpsResourceAccessor` on the IAP resource.
+
+## Supported IAP configurations
+
+Which credential the proxy must present depends on how IAP is deployed — above all on whether IAP uses a **custom** OAuth client or Google's **managed** one. The *token type* is what matters, not just the audience.
+
+| IAP deployment | OAuth client | Token the proxy sends | `--audience` | Status |
+|---|---|---|---|---|
+| Behind an external HTTPS load balancer | Custom | OIDC ID token (`impersonate` / `adc` / `oauth`) | IAP OAuth client ID (`NNN.apps.googleusercontent.com`) | ✅ Supported — OIDC acceptance verified against a live IAP |
+| Direct Cloud Run IAP | Google-managed (the default when you enable IAP today) | Self-signed service-account JWT | canonical `*.run.app` URL + `/*` | ❌ Not yet — IAP rejects OIDC tokens here; a self-signed-JWT mode is required |
+| Direct Cloud Run IAP | Custom / allow-listed | OIDC ID token | OAuth client ID | ⚠️ Expected to work, not yet verified |
+
+- Since Google shut down the IAP OAuth Admin API (March 2026), newly-secured apps default to a **Google-managed** OAuth client, and that configuration **rejects Google-issued OIDC ID tokens** (`Invalid IAP credentials: Invalid bearer token. Invalid JWT audience.`) for every audience. Programmatic access there needs a **self-signed service-account JWT** (`iss`=`sub`=SA email, signed via the IAM `signJwt` API) with the audience set to the canonical `run.app` URL plus a path or `/*` wildcard. This mode is not implemented yet.
+- New custom OAuth clients can no longer be created via API (console only); existing custom clients keep working.
 
 ## Notes
 
