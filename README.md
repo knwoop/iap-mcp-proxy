@@ -64,8 +64,8 @@ iap-mcp-proxy [flags] <UPSTREAM_URL>
 | `--audience` | `IAP_MCP_AUDIENCE` | origin of `UPSTREAM_URL` | OIDC token audience. LB-backed IAP: the IAP OAuth client ID (`NNN.apps.googleusercontent.com`). Direct Cloud Run IAP: depends on the OAuth client — see [Supported IAP configurations](#supported-iap-configurations). |
 | `--credentials` | `IAP_MCP_CREDENTIALS` | `auto` | `auto`, `adc`, `impersonate`, `oauth`, `signjwt`. |
 | `--impersonate-service-account` | `IAP_MCP_IMPERSONATE_SA` | — | Target SA email. `impersonate` mints an ID token as it; `signjwt` signs a self-signed JWT as it. |
-| `--downstream-auth` | `IAP_MCP_DOWNSTREAM_AUTH` | — | Value forwarded as the upstream `Authorization` header. Supports `env:VAR_NAME` indirection so secrets stay out of client config files. |
-| `--refresh-margin` | `IAP_MCP_REFRESH_MARGIN` | `5m` | Refresh the ID token this long before expiry. |
+| `--downstream-auth` | `IAP_MCP_DOWNSTREAM_AUTH` | — | Value forwarded as the upstream `Authorization` header. Supports `env:VAR_NAME` indirection so secrets stay out of client config files, and `cmd:COMMAND` to run a command that prints only a JWT on stdout, forwarded as `Bearer <jwt>` and re-run before its `exp`. The command runs without a shell and its arguments are split on whitespace, with no quoting. |
+| `--refresh-margin` | `IAP_MCP_REFRESH_MARGIN` | `5m` | Refresh the IAP token (and a `cmd:` downstream token) this long before expiry. |
 | `--timeout` | `IAP_MCP_TIMEOUT` | `120s` | Upstream timeout: total for JSON responses, idle (time between reads) for SSE streams — so long-running streaming tool calls are not killed while data or keepalives keep arriving. |
 | `--log-level` | `IAP_MCP_LOG` | `warn` | `debug` / `info` / `warn` / `error`. Logs go to stderr only. |
 | `--version` | — | — | Print version and exit. |
@@ -97,8 +97,8 @@ Which credential the proxy must present depends on how IAP is deployed — above
 
 ## Notes
 
-- The IAP token travels in `Proxy-Authorization`, which IAP consumes and strips — your app never sees it. If your app has its own auth, pass it with `--downstream-auth` and it is forwarded verbatim as `Authorization`.
-- On a 401 (or a 302 into Google sign-in) the proxy refreshes the token and retries once; a second failure is surfaced to the MCP client as a JSON-RPC error with an actionable message on stderr.
+- The IAP token travels in `Proxy-Authorization`, which IAP consumes and strips — your app never sees it. If your app has its own auth, pass it with `--downstream-auth` and it is forwarded verbatim as `Authorization` (a `cmd:` token gets a `Bearer ` prefix). For a short-lived end-user token, use `cmd:`, e.g. `--downstream-auth "cmd:gcloud auth print-identity-token"` forwards the caller's Google ID token and re-runs the command before the token expires, so the proxy does not need restarting every hour. The command runs once at startup and the proxy exits if it fails.
+- On a 401 (or a 302 into Google sign-in) the proxy refreshes the token (and a `cmd:` downstream token) and retries once; a second failure is surfaced to the MCP client as a JSON-RPC error with an actionable message on stderr.
 - If the upstream reports the session expired (HTTP 404 — e.g. after a Cloud Run redeploy), the proxy transparently replays the cached `initialize` handshake to obtain a fresh session and retries the request; the stdio client never notices.
 - If a streaming (SSE) response drops mid-tool-call and the server tags events with IDs, the proxy resumes it with `Last-Event-ID` instead of losing the response.
 - After `initialize`, the proxy opens the standalone GET SSE stream so server-initiated messages (`notifications/tools/list_changed`, sampling/elicitation requests, log notifications) reach the client, reconnecting with `Last-Event-ID` if the stream drops. Servers that respond 405 (no standalone stream) are handled silently.

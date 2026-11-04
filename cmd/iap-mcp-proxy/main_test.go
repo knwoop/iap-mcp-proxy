@@ -3,6 +3,8 @@ package main
 import (
 	"net/url"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func TestDefaultAudience(t *testing.T) {
@@ -37,6 +39,40 @@ func TestDefaultAudience(t *testing.T) {
 		}
 		if got := defaultAudience(c.mode, u); got != c.want {
 			t.Errorf("defaultAudience(%q, %q) = %q, want %q", c.mode, c.upstream, got, c.want)
+		}
+	}
+}
+
+func TestResolveDownstreamAuth(t *testing.T) {
+	t.Setenv("IAP_MCP_TEST_TOKEN", "Bearer from-env")
+	t.Setenv("IAP_MCP_TEST_EMPTY", "")
+	cases := []struct {
+		in      string
+		want    downstreamAuth
+		wantErr bool
+	}{
+		{in: "Bearer literal", want: downstreamAuth{value: "Bearer literal"}},
+		{in: "env:IAP_MCP_TEST_TOKEN", want: downstreamAuth{value: "Bearer from-env"}},
+		{in: "env:IAP_MCP_TEST_EMPTY", wantErr: true},
+		{in: "env:IAP_MCP_TEST_UNSET", wantErr: true},
+		{in: "cmd:gcloud auth  print-identity-token", want: downstreamAuth{command: []string{"gcloud", "auth", "print-identity-token"}}},
+		{in: "cmd:", wantErr: true},
+		{in: "cmd:   ", wantErr: true},
+	}
+	for _, c := range cases {
+		got, err := resolveDownstreamAuth(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("resolveDownstreamAuth(%q) = %+v, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("resolveDownstreamAuth(%q) error: %v", c.in, err)
+			continue
+		}
+		if diff := cmp.Diff(c.want, got, cmp.AllowUnexported(downstreamAuth{})); diff != "" {
+			t.Errorf("resolveDownstreamAuth(%q) mismatch (-want +got):\n%s", c.in, diff)
 		}
 	}
 }

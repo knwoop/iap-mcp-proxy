@@ -138,6 +138,52 @@ func TestTransportTreats302ToGoogleAsAuthFailure(t *testing.T) {
 	}
 }
 
+func TestTransportSetsRefreshedDownstreamToken(t *testing.T) {
+	var gotAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		if len(gotAuth) == 1 {
+			http.Error(w, "expired end-user token", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cached, _ := newTestCached(t)
+	downstream, fake := newTestCached(t)
+	client := &http.Client{Transport: &Transport{Source: cached, Downstream: downstream, DownstreamAuth: "Bearer ignored"}}
+	resp, err := client.Post(srv.URL, "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 after retry", resp.StatusCode)
+	}
+	if fake.calls != 2 {
+		t.Errorf("downstream mints = %d, want 2 (refresh on 401)", fake.calls)
+	}
+	for i, a := range gotAuth {
+		if !strings.HasPrefix(a, "Bearer ey") {
+			t.Errorf("attempt %d Authorization = %q, want Bearer <downstream jwt>", i+1, a)
+		}
+	}
+}
+
+func TestTransportDownstreamTokenError(t *testing.T) {
+	cached, _ := newTestCached(t)
+	fake := &fakeSource{mint: func(n int) (string, error) {
+		return "", context.DeadlineExceeded
+	}}
+	client := &http.Client{Transport: &Transport{Source: cached, Downstream: NewCached(fake, time.Minute)}}
+	_, err := client.Get("http://127.0.0.1:0/never")
+	if err == nil || !strings.Contains(err.Error(), "obtaining downstream token") {
+		t.Fatalf("want downstream token error, got %v", err)
+	}
+}
+
 func TestTransportTokenError(t *testing.T) {
 	fake := &fakeSource{mint: func(n int) (string, error) {
 		return "", context.DeadlineExceeded
