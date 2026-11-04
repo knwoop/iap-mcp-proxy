@@ -48,7 +48,7 @@ func run() int {
 		audience       = fs.String("audience", envOr("IAP_MCP_AUDIENCE", ""), "token audience: IAP OAuth client ID (LB-backed IAP) or service URL (OIDC modes). Default: origin of UPSTREAM_URL, or the exact upstream endpoint for signjwt (pass <origin>/* to cover all paths).")
 		credentials    = fs.String("credentials", envOr("IAP_MCP_CREDENTIALS", "auto"), "credential source: auto, adc, impersonate, oauth, signjwt")
 		impersonateSA  = fs.String("impersonate-service-account", envOr("IAP_MCP_IMPERSONATE_SA", ""), "target service account email (impersonate mode signs an ID token; signjwt mode signs a self-signed JWT)")
-		downstreamAuth = fs.String("downstream-auth", envOr("IAP_MCP_DOWNSTREAM_AUTH", ""), "value forwarded as the upstream Authorization header; supports env:VAR_NAME indirection")
+		downstreamAuth = fs.String("downstream-auth", envOr("IAP_MCP_DOWNSTREAM_AUTH", ""), "value forwarded as the upstream Authorization header; supports env:VAR_NAME indirection, and cmd:COMMAND to forward a JWT the command prints as a bearer token, re-running it before the token expires")
 		refreshMargin  = fs.Duration("refresh-margin", 5*time.Minute, "refresh the ID token this long before expiry (env IAP_MCP_REFRESH_MARGIN)")
 		timeout        = fs.Duration("timeout", 120*time.Second, "upstream timeout: total for JSON responses, idle (between reads) for SSE streams (env IAP_MCP_TIMEOUT)")
 		logLevel       = fs.String("log-level", envOr("IAP_MCP_LOG", "warn"), "log level: debug, info, warn, error")
@@ -137,11 +137,26 @@ func run() int {
 		return exitAuthError
 	}
 
+	var downstreamSource *auth.Cached
+	if len(downstream.command) > 0 {
+		src, err := auth.NewCommandSource(downstream.command)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "iap-mcp-proxy:", err)
+			return exitConfigError
+		}
+		downstreamSource = auth.NewCached(src, *refreshMargin)
+		if _, err := downstreamSource.Token(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "iap-mcp-proxy: downstream auth bootstrap failed (the cmd: command must print only a JWT on stdout):", err)
+			return exitAuthError
+		}
+	}
+
 	client := &http.Client{
 		Transport: &auth.Transport{
 			Source:         source,
 			Audience:       aud,
-			DownstreamAuth: downstream,
+			DownstreamAuth: downstream.value,
+			Downstream:     downstreamSource,
 			Logger:         logger,
 		},
 		// Never follow redirects: a 302 to accounts.google.com is an
@@ -221,18 +236,34 @@ func defaultAudience(mode string, u *url.URL) string {
 	return origin + path
 }
 
+// downstreamAuth is a parsed --downstream-auth value: either a fixed
+// Authorization header value, or a command that prints a bearer JWT.
+type downstreamAuth struct {
+	value   string
+	command []string
+}
+
 // resolveDownstreamAuth resolves env:VAR_NAME indirection so secrets
-// don't have to appear in MCP client config files.
-func resolveDownstreamAuth(v string) (string, error) {
+// don't have to appear in MCP client config files, and cmd:COMMAND for
+// short-lived tokens the proxy must refresh. The command is split on
+// whitespace and run without a shell.
+func resolveDownstreamAuth(v string) (downstreamAuth, error) {
+	if rest, ok := strings.CutPrefix(v, "cmd:"); ok {
+		argv := strings.Fields(rest)
+		if len(argv) == 0 {
+			return downstreamAuth{}, errors.New("--downstream-auth cmd: needs a command, e.g. cmd:gcloud auth print-identity-token")
+		}
+		return downstreamAuth{command: argv}, nil
+	}
 	name, ok := strings.CutPrefix(v, "env:")
 	if !ok {
-		return v, nil
+		return downstreamAuth{value: v}, nil
 	}
 	val := os.Getenv(name)
 	if val == "" {
-		return "", fmt.Errorf("--downstream-auth points at env:%s but %s is empty or unset", name, name)
+		return downstreamAuth{}, fmt.Errorf("--downstream-auth points at env:%s but %s is empty or unset", name, name)
 	}
-	return val, nil
+	return downstreamAuth{value: val}, nil
 }
 
 // newLogger builds a stderr-only slog logger; stdout is reserved for

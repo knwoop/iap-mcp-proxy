@@ -12,16 +12,19 @@ import (
 
 // Transport is an http.RoundTripper that attaches an IAP ID token as
 // Proxy-Authorization (IAP consumes and strips it, so the upstream app
-// never sees it) and optionally a downstream Authorization header.
+// never sees it) and optionally a downstream Authorization header:
+// either a fixed DownstreamAuth value, or a bearer token from
+// Downstream, which is refreshed like the IAP token.
 //
-// On an IAP auth failure (401, or 302 to accounts.google.com) it
-// refreshes the token once and retries once; a second consecutive
-// failure is returned to the caller.
+// On an auth failure (401, or 302 to accounts.google.com) it refreshes
+// both tokens once and retries once; a second consecutive failure is
+// returned to the caller.
 type Transport struct {
 	Base           http.RoundTripper
 	Source         *Cached
 	Audience       string
 	DownstreamAuth string
+	Downstream     *Cached
 	Logger         *slog.Logger
 }
 
@@ -65,6 +68,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		"status", resp.StatusCode, "iap_generated", iap.IsIAPResponse(resp))
 	drain(resp)
 	t.Source.Invalidate()
+	if t.Downstream != nil {
+		t.Downstream.Invalidate()
+	}
 
 	resp, err = t.send(req, body)
 	if err != nil {
@@ -91,7 +97,14 @@ func (t *Transport) send(req *http.Request, body []byte) (*http.Response, error)
 		return nil, fmt.Errorf("obtaining IAP ID token: %w", err)
 	}
 	r.Header.Set("Proxy-Authorization", "Bearer "+tok)
-	if t.DownstreamAuth != "" {
+	switch {
+	case t.Downstream != nil:
+		dtok, err := t.Downstream.Token(r.Context())
+		if err != nil {
+			return nil, fmt.Errorf("obtaining downstream token: %w", err)
+		}
+		r.Header.Set("Authorization", "Bearer "+dtok)
+	case t.DownstreamAuth != "":
 		r.Header.Set("Authorization", t.DownstreamAuth)
 	}
 	return t.base().RoundTrip(r)
